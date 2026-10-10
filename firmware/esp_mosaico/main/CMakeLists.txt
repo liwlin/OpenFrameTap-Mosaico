@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "oft_board.c" "oft_ui.c" "oft_ui_geometry.c" "oft_touch.c" "oft_peripherals.c" "oft_gauge.c" "oft_ble.c" "oft_network.c" "oft_udp.c" "oft_rx_queue.c" "oft_motion.c" "oft_video.cpp"
+idf_component_register(SRCS "main.c" "oft_alloc_diag.c" "oft_board.c" "oft_ui.c" "oft_ui_geometry.c" "oft_touch.c" "oft_peripherals.c" "oft_gauge.c" "oft_ble.c" "oft_network.c" "oft_udp.c" "oft_rx_queue.c" "oft_motion.c" "oft_video.cpp"
     "../components/oft_protocol/test/test_duml.c"
     "../components/oft_protocol/test/test_wifi_profile.c"
     "../components/oft_protocol/test/test_capture.c"
@@ -21,6 +21,8 @@ if("$ENV{OFT_RESIDUAL_IRAM}" STREQUAL "1")
 endif()
 target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=unity_putc" "-Wl,--wrap=unity_flush")
 target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=sys_mbox_new" "-Wl,--wrap=sys_mbox_trypost" "-Wl,--wrap=sys_mbox_free")
+target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_wifi_internal_tx")
+target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_wifi_internal_tx_by_ref")
 if(NOT CMAKE_BUILD_EARLY_EXPANSION AND DEFINED ENV{OFT_BENCH_FIXTURE})
     set(fixture "$ENV{OFT_BENCH_FIXTURE}")
     if(NOT EXISTS "${fixture}")

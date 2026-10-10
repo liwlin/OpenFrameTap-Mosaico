@@ -1,5 +1,6 @@
 #include "oft_wifi_wire.h"
 #include "oft_duml.h"
+#include <errno.h>
 #include <string.h>
 
 static uint16_t get16(const uint8_t *p){return p[0]|((uint16_t)p[1]<<8);}
@@ -82,6 +83,37 @@ size_t oft_wifi_ack(const oft_wifi_session_t *s,uint8_t *out,size_t cap)
     put16(out+8,s->media_received);put16(out+10,s->media_received);
     put16(out+16,s->reply_received);put16(out+18,s->reply_received);
     put16(out+24,s->peer);put16(out+26,s->last_sent);return 34;
+}
+oft_wifi_ack_send_result_t oft_wifi_ack_classify_send(int sent,int error)
+{
+    if(sent==34)return OFT_WIFI_ACK_SEND_OK;
+    if(sent==-1&&(error==ENOMEM||error==EAGAIN||error==EWOULDBLOCK))return OFT_WIFI_ACK_SEND_RETRY;
+    return OFT_WIFI_ACK_SEND_FATAL;
+}
+oft_wifi_ack_step_result_t oft_wifi_ack_tx_step(oft_wifi_ack_tx_t *tx,const oft_wifi_session_t *wire,
+    int64_t now_us,oft_wifi_ack_send_fn send,void *ctx)
+{
+    /* Retry only cumulative ACKs: one attempt per 5ms, at most 100ms total.
+       The caller must keep running all other deadlines and control processing. */
+    if(!tx||!wire||!send)return OFT_WIFI_ACK_FAILED;
+    if(tx->retrying){
+        if(now_us<tx->first_failure_us||now_us-tx->first_failure_us>=100000){
+            tx->retrying=false;return OFT_WIFI_ACK_FAILED;
+        }
+        if(now_us<tx->next_due_us)return OFT_WIFI_ACK_IDLE;
+    }else if(now_us<tx->next_due_us)return OFT_WIFI_ACK_IDLE;
+    uint8_t ack[34];size_t n=oft_wifi_ack(wire,ack,sizeof(ack));
+    if(n!=34)return OFT_WIFI_ACK_FAILED;
+    oft_wifi_ack_send_result_t r=send(ack,n,ctx);
+    if(r==OFT_WIFI_ACK_SEND_OK){
+        tx->retrying=false;tx->first_failure_us=0;tx->next_due_us=now_us+25000;
+        return OFT_WIFI_ACK_SENT;
+    }
+    if(r==OFT_WIFI_ACK_SEND_RETRY){
+        if(!tx->retrying){tx->retrying=true;tx->first_failure_us=now_us;}
+        tx->next_due_us=now_us+5000;return OFT_WIFI_ACK_DEFERRED;
+    }
+    tx->retrying=false;return OFT_WIFI_ACK_FAILED;
 }
 size_t oft_wifi_wrap(oft_wifi_session_t *s,const uint8_t *duml,size_t n,uint8_t *out,size_t cap)
 {

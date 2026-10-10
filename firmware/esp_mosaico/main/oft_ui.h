@@ -4,4 +4,5 @@
 bool oft_ui_pointer(int x,int y,bool down,bool valid);
 bool oft_ui_menu_test(void);
 void oft_ui_create(void);
+void oft_ui_preview_enabled(bool enabled);
 bool oft_ui_hold_test(void); /* Shadow LVGL pointer only; never routes to camera control. */

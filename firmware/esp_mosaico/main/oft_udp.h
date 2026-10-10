@@ -14,7 +14,12 @@ typedef struct {
     oft_udp_state_t state;char detail[64];
     unsigned packets,media_packets,bytes,acks,frames,invalid_packets,ambiguous_status;
     unsigned registrations,enable_count,heartbeat_sent,heartbeat_replies;
+    unsigned ack_deferred,ack_recovered,ack_failures,max_ack_retry_us;
+    int ack_last_errno;
+    bool ack_retry_active;
     unsigned keyframe_requests,keyframe_replies,keyframe_failures;
+    unsigned keyframe_confirmed_request,keyframe_timeouts,keyframe_timeout_request;
+    unsigned keyframe_remote_timeouts;
     int64_t keyframe_sent_us;bool keyframe_pending;
     unsigned commands,nonzero_commands,zero_commands,control_failures;
     uint32_t max_ack_gap_us,stack_free;
@@ -27,7 +32,7 @@ typedef struct {
     uint8_t gimbal_status_frame[2][96],gimbal_status_size[2];
     int64_t gimbal_status_us[2];
     bool probe_running,probe_done;
-    bool zero_receipt_confirmed;uint32_t first_zero_delay_us;
+    bool zero_receipt_confirmed;uint32_t first_zero_delay_us;int64_t zero_receipt_us;
     bool live_enabled;unsigned mock_commands,mock_zeros,action_count;
     bool action_busy;
     bool settings_busy;

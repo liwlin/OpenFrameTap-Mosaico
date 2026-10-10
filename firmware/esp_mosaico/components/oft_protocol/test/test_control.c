@@ -45,6 +45,14 @@ static void test_watchdog_fault_and_explicit_reset(void)
     oft_control_reset(&c);oft_control_tick(&c,&in,true,1500000,mock_send,&w);TEST_ASSERT_EQUAL_INT(0,w.p);
     in.gesture++;oft_control_tick(&c,&in,true,1500000,mock_send,&w);TEST_ASSERT_NOT_EQUAL(0,w.p);
     oft_control_tick(&c,&in,false,1500001,mock_send,&w);TEST_ASSERT_EQUAL_INT(0,w.p);TEST_ASSERT_EQUAL_INT(OFT_CONTROL_FAULT,c.state);
+    TEST_ASSERT_TRUE(oft_control_is_guard_fault(&c));
+    TEST_ASSERT_FALSE(oft_control_rearm_on_release(&c,&in,true,1500001));
+    oft_input_t release=in;release.active=false;release.timestamp_us=1500001;
+    TEST_ASSERT_FALSE(oft_control_rearm_on_release(&c,&release,false,1500001));
+    TEST_ASSERT_TRUE(oft_control_rearm_on_release(&c,&release,true,1500001));
+    TEST_ASSERT_EQUAL_INT(OFT_CONTROL_DISABLED,c.state);
+    oft_control_tick(&c,&in,true,1500001,mock_send,&w);TEST_ASSERT_EQUAL_INT(0,w.p);
+    in.gesture++;in.timestamp_us=1600001;oft_control_tick(&c,&in,true,1600001,mock_send,&w);TEST_ASSERT_NOT_EQUAL(0,w.p);
 }
 static void test_failed_zero_is_not_reported_as_stopped(void)
 {
@@ -56,10 +64,14 @@ static void test_failed_zero_is_not_reported_as_stopped(void)
     TEST_ASSERT_EQUAL_UINT(0,c.zeros);TEST_ASSERT_EQUAL_INT(188,c.yaw_offset);
     TEST_ASSERT_EQUAL_INT(OFT_CONTROL_FAULT,c.state);
     oft_control_reset(&c);TEST_ASSERT_EQUAL_INT(OFT_CONTROL_FAULT,c.state);
+    oft_input_t release={.gesture=1,.timestamp_us=1000001};
+    TEST_ASSERT_FALSE(oft_control_is_guard_fault(&c));
+    TEST_ASSERT_FALSE(oft_control_rearm_on_release(&c,&release,true,1000001));
     oft_control_init(&c);w.calls=0;
     oft_control_tick(&c,&in,true,1000000,mock_send,&w);
     TEST_ASSERT_EQUAL_UINT(3,w.calls); /* failed initial send still attempts zero */
     TEST_ASSERT_TRUE(c.stop_required);
+    TEST_ASSERT_FALSE(oft_control_rearm_on_release(&c,&release,true,1000001));
 }
 void oft_control_selftests(void)
 {

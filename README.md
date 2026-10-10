@@ -1,12 +1,18 @@
 # OpenFrameTap Mosaico
 
+> **本次 Release 硬件版本：ESP-Mosaico V1.2（ESP32-S31）。预编译固件仅适用于 V1.2，不适用于 V1.0 或其他板型。**
+
 **把 ESP-Mosaico 变成 DJI Osmo Pocket 3 的独立触摸遥控器。**
 
-OpenFrameTap Mosaico 是一个运行在 **ESP-Mosaico V1.0 / ESP32-S31** 上的实验性相机控制固件。无需手机或 Linux 开发板作为运行主机，即可连接 Pocket 3，使用触摸摇杆、相对姿态头追和实体拍摄键，并查看相机状态与低帧率图像预览。
+OpenFrameTap Mosaico 是一个运行在 **ESP-Mosaico V1.0 / V1.2（ESP32-S31）** 上的实验性相机控制固件。无需手机或 Linux 开发板作为运行主机，即可连接 Pocket 3，使用触摸摇杆、相对姿态头追和实体拍摄键，并查看相机状态与低帧率图像预览。
 
 本项目源自 OpenFrameTap 的 ROCK 4D 实现，但采用独立的 ESP-IDF / FreeRTOS / LVGL 技术栈。**仅实现 Pocket 3 的常规模式：Mosaico 加入相机自己的 2.4 GHz 热点，不使用外部路由器或 RTMP 直播。**
 
 > 当前是经过单套硬件实测的开发原型，不是 DJI 官方产品。仅 Pocket 3 已验证；不保证其他机型、固件版本或 Mosaico 修订版兼容。
+
+当前发布为 **v0.1.0-preview.1 开发预览版**，预编译固件仅面向 **Mosaico V1.2**。
+[下载 Release](https://github.com/liwlin/OpenFrameTap-Mosaico/releases/tag/v0.1.0-preview.1) ·
+[验证范围与已知问题](docs/mosaico-full-bench.md)。持续操控已有有限实测，长时间图传仍可能停更或会话超时；最新 E1 恢复分支已通过主机回归，尚未取得实机触发后恢复的证据。
 
 ## 已有功能
 
@@ -20,7 +26,7 @@ OpenFrameTap Mosaico 是一个运行在 **ESP-Mosaico V1.0 / ESP32-S31** 上的�
 | 实体拍摄键 | Function Button 按相机当前模式拍照或开始录像；录像中再次短按停止并保存 |
 | 相机规格 | 左侧双拨轮调整普通录像分辨率 / 帧率，以及照片画幅 / 文件格式；提供 Video / Photo 切换 |
 | 数码变焦 | 右侧滑块，按当前 Pocket 3 模式和分辨率限制范围 |
-| 图像预览 | 实际接收并软件解码 Pocket 3 的 H.264 图像，在 HEAD 模式中央显示；低帧率、非流畅视频 |
+| 图像预览 | 实际接收并软件解码 Pocket 3 的 H.264 图像，HEAD / JOYSTICK 都保留预览；低帧率、非流畅视频 |
 | 状态与电量 | BLE / Wi-Fi / 会话状态、Pocket 电量、Mosaico 电压及带估算标记的本机电量 |
 | 触摸界面 | 深色大触摸区域、四边滑出的半透明径向菜单，尽量留出中央画面 |
 
@@ -28,7 +34,7 @@ OpenFrameTap Mosaico 是一个运行在 **ESP-Mosaico V1.0 / ESP32-S31** 上的�
 
 当前使用 OpenH264 **软件解码**，不是 ESP32-S31 的 H.264 硬件解码。通过限制解码负载、丢弃过时图像及有界刷新恢复，在小屏幕上显示真实连续更新的画面。
 
-历史短窗口测量通常约 **1–2 fps**，复杂场景、无线状态与解码耗时都会影响更新率及延迟。这不是稳定帧率承诺，也不能替代低延迟 FPV。中央显示约 **352 × 198**；默认 JOYSTICK 模式隐藏预览，切换 HEAD 后显示，**无需按住头追才能看画面**。现有 FRESH 预览策略暂时冻结。
+历史短窗口测量通常约 **1–2 fps**，复杂场景、无线状态与解码耗时都会影响更新率及延迟。这不是稳定帧率承诺，也不能替代低延迟 FPV。中央显示约 **352 × 198**；HEAD / JOYSTICK 都保留预览，**无需按住头追才能看画面**。当前 FRESH 策略采用1500ms主动关键帧请求间隔、900ms处理预算，并为视频ACK超时提供有限恢复；实机验收见 [本机测试记录](docs/mosaico-full-bench.md)。
 
 ### 相机规格与变焦
 
@@ -59,12 +65,12 @@ OpenFrameTap Mosaico 是一个运行在 **ESP-Mosaico V1.0 / ESP32-S31** 上的�
 
 ## 硬件与开发环境
 
-已验证硬件为 **ESP-Mosaico V1.0（ESP32-S31）** 和 **DJI Osmo Pocket 3**：
+本次开发与预编译发布针对 **ESP-Mosaico V1.2（ESP32-S31）** 和 **DJI Osmo Pocket 3**。源码保留上游 V1.0 板级配置和历史验证记录；不同板型须显式选择：
 
 - 480 × 480 圆角 CO5300 屏幕及 CST9220 系列触摸（使用 CST9217 兼容驱动）。
 - BMI270 六轴 IMU、两颗 BMM150 地磁传感器、振动马达与 Function Button。
 - 16 MB PSRAM；USB CDC 日志与下载恢复。
-- BQ27220 电量计；当前电池配置仅针对已确认的 **65 mAh** 电池。
+- BQ27220 电量计；继承的电池修正逻辑仅适用于已确认的 **65 mAh** 电池，本次 V1.2 电池容量未校准。
 
 开发使用 **ESP-IDF 6.1 的 esp32s31 preview target**，不是 esp32s3。依赖锁定于 `dependencies.lock`，OpenH264 固定为子模块提交。不要通过升级 SDK 或替换芯片目标来绕过编译错误。
 
@@ -74,18 +80,23 @@ OpenFrameTap Mosaico 是一个运行在 **ESP-Mosaico V1.0 / ESP32-S31** 上的�
 git submodule update --init --recursive
 ```
 
-Windows / PowerShell、已安装匹配 EIM 环境时：
+本次验证使用 Ubuntu 24.04 / WSL2 和固定 SDK：
 
-```powershell
-./scripts/mosaico.ps1 configure
-./scripts/mosaico.ps1 build
+```sh
+export MOSAICO_IDF_PATH=/path/to/pinned/esp-idf
+MOSAICO_BOARD=v1.2 bash scripts/mosaico-ubuntu2404.sh
 ```
+
+SDK 提交、构建入口、产物位置和核对步骤见
+[Ubuntu2404 构建说明](docs/ubuntu2404.md)。继承的 Windows/EIM 入口保留在 `scripts/mosaico.ps1`，本次未重新验证其 Windows 构建环境。
+硬件版本必须明确选择：V1.2 板级配置见
+[Mosaico V1.2 适配与烧录记录](docs/mosaico-v1.2.md)，V1.0 引脚不能直接用于 V1.2。
 
 首次烧录前必须核对芯片、串口和现有分区。当前脚本是**应用分区烧录**，不是任意新板的一键全量安装器。具体操作、SDK 路径和恢复说明见 [构建与烧录](docs/build.md)。
 
 ## 电量说明
 
-右上角为 Pocket 电量，左上角为 Mosaico 本机电量 / 电压。**M~ 表示估算值**：当前 65 mAh 电池的可回滚 RAM 配置已完成读回与充电观察，但尚无修正后完整放电精度验证。
+右上角为 Pocket 电量，左上角为 Mosaico 本机电量 / 电压。**M~ 表示估算值**；本次 V1.2 的电量计尚未完成容量校准。上游另一套 65 mAh 硬件曾验证可回滚 RAM 配置读回与充电观察，该结果不能作为本机校准证明。
 
 不要把该电量计配置应用到其他容量的电池。普通使用不需要执行电量计诊断或修正命令；不要改写 OTP、改变充电硬件或强制深度放电。
 

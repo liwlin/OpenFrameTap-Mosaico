@@ -19,6 +19,7 @@ bool oft_p3_ble_reply_matches(oft_p3_command_t command,uint16_t sequence,const o
 bool oft_p3_wifi_string(const uint8_t *payload,size_t size,bool password,char *out,size_t capacity);
 bool oft_p3_battery(const oft_duml_frame_t *frame,uint8_t *percent);
 bool oft_p3_advertisement(const uint8_t *manufacturer,size_t size);
+bool oft_p3_control_heartbeat_payload_valid(const uint8_t *payload,size_t size);
 bool oft_p3_gimbal_candidates(const oft_duml_frame_t *frame,int16_t values[3]);
 /* Experimental angle feedback; yaw16 /100 and pitch20 /-10. Cross-checked
    against captured flip/tilt and quaternion deltas; not physical gain acceptance. */

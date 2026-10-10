@@ -4,12 +4,14 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <errno.h>
 
 typedef struct {char ssid[33],password[65];} join_t;
 static QueueHandle_t requests;
@@ -20,6 +22,50 @@ static oft_network_snapshot_t view;
 static const char *TAG="oft_wifi";
 static bool initialized,ram_storage,started,wanted;
 static int64_t deadline,retry_at;
+
+/* Observe both SDK TX paths without changing buffer ownership or
+   retrying camera commands. Print from main, never from the network callback. */
+static struct {unsigned calls,by_ref,failures,bytes,first_bytes;int result;int64_t at_us,first_us;} tx_diag;
+int __real_esp_wifi_internal_tx(wifi_interface_t wifi_if,void *buffer,uint16_t len);
+esp_err_t __real_esp_wifi_internal_tx_by_ref(wifi_interface_t wifi_if,void *buffer,size_t len,void *netstack_buf);
+static void record_tx(int rc,size_t len,bool by_ref)
+{
+    int saved_errno=errno;
+    int64_t now=rc==ESP_OK?0:esp_timer_get_time();
+    portENTER_CRITICAL(&mux);
+    tx_diag.calls++;tx_diag.by_ref+=by_ref;
+    if(rc!=ESP_OK){
+        if(!tx_diag.failures){tx_diag.first_us=now;tx_diag.first_bytes=(unsigned)len;}
+        tx_diag.failures++;tx_diag.result=rc;tx_diag.bytes=(unsigned)len;tx_diag.at_us=now;
+    }
+    portEXIT_CRITICAL(&mux);
+    errno=saved_errno;
+}
+int __wrap_esp_wifi_internal_tx(wifi_interface_t wifi_if,void *buffer,uint16_t len)
+{
+    int rc=__real_esp_wifi_internal_tx(wifi_if,buffer,len);
+    record_tx(rc,len,false);
+    return rc;
+}
+esp_err_t __wrap_esp_wifi_internal_tx_by_ref(wifi_interface_t wifi_if,void *buffer,size_t len,void *netstack_buf)
+{
+    esp_err_t rc=__real_esp_wifi_internal_tx_by_ref(wifi_if,buffer,len,netstack_buf);
+    record_tx(rc,len,true);
+    return rc;
+}
+void oft_network_tx_diag_dump(void)
+{
+    static unsigned reported_calls,reported_failures;
+    portENTER_CRITICAL(&mux);
+    unsigned calls=tx_diag.calls,refs=tx_diag.by_ref,failures=tx_diag.failures,bytes=tx_diag.bytes,first_bytes=tx_diag.first_bytes;
+    int result=tx_diag.result;int64_t at_us=tx_diag.at_us,first_us=tx_diag.first_us;
+    portEXIT_CRITICAL(&mux);
+    if(calls!=reported_calls||failures!=reported_failures){
+        reported_calls=calls;reported_failures=failures;
+        printf("OFT_WIFI_TX calls=%u by_ref=%u failures=%u last_rc=%d first_bytes=%u first_error_us=%lld last_bytes=%u last_error_us=%lld\n",
+            calls,refs,failures,result,first_bytes,(long long)first_us,bytes,(long long)at_us);
+    }
+}
 
 void oft_network_snapshot(oft_network_snapshot_t *out){portENTER_CRITICAL(&mux);*out=view;portEXIT_CRITICAL(&mux);}
 static void state(oft_network_state_t s)
@@ -60,8 +106,16 @@ static esp_err_t initialize_wifi(void)
         cfg.static_rx_buf_num=16;
         cfg.dynamic_rx_buf_num=64;
         cfg.rx_ba_win=16;
+        /* A/B control-link profile: keep downstream video aggregation, but
+           send small upstream control/ACK frames without TX aggregation.
+           This does not relax any input, receipt or keepalive deadline. */
+        cfg.ampdu_tx_enable=0;
         ESP_LOGI(TAG,"RX budget static=%d dynamic=%d ba_window=%d",cfg.static_rx_buf_num,cfg.dynamic_rx_buf_num,cfg.rx_ba_win);
         rc=esp_wifi_init(&cfg);if(rc!=ESP_OK)return rc;
+        ESP_LOGI(TAG,"TX budget type=%d static=%d cache=%d ampdu_tx=%d ampdu_rx=%d internal_free=%u largest=%u",
+            cfg.tx_buf_type,cfg.static_tx_buf_num,cfg.cache_tx_buf_num,cfg.ampdu_tx_enable,cfg.ampdu_rx_enable,
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
         initialized=true;
     }
     rc=esp_wifi_set_storage(WIFI_STORAGE_RAM);if(rc!=ESP_OK)return rc;

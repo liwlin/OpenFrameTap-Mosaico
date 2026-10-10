@@ -1,0 +1,17 @@
+menu "OpenFrameTap Mosaico"
+
+choice OFT_MOSAICO_BOARD_REVISION
+    prompt "ESP-Mosaico board revision"
+    default OFT_MOSAICO_BOARD_V1_0
+    help
+        Select the physical ESP-Mosaico board revision so board-local GPIO
+        assignments match the assembled LCD and internal I2C routing.
+
+    config OFT_MOSAICO_BOARD_V1_0
+        bool "ESP-Mosaico V1.0"
+
+    config OFT_MOSAICO_BOARD_V1_2
+        bool "ESP-Mosaico V1.2"
+endchoice
+
+endmenu

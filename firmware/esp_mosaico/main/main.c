@@ -15,6 +15,7 @@
 #include "oft_board.h"
 #include "oft_ble.h"
 #include "oft_network.h"
+#include "oft_alloc_diag.h"
 #include "oft_udp.h"
 #include "oft_rx_queue.h"
 #include "oft_motion.h"
@@ -71,6 +72,7 @@ void app_main(void)
     ESP_ERROR_CHECK(tinyusb_console_init(TINYUSB_CDC_ACM_0));
     if(xTaskCreatePinnedToCore(early_download_watch,"oft_early_usb",2048,NULL,6,NULL,0)!=pdPASS)ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     vTaskDelay(pdMS_TO_TICKS(3000)); // Enumerate CDC before display/tests; explicit1200-baud recovery stays available.
+    printf("OFT_ALLOC_DIAG start=%s\n",esp_err_to_name(oft_alloc_diag_start()));
     esp_err_t board_result=oft_board_display_start();
     esp_chip_info_t chip;
     esp_chip_info(&chip);
@@ -79,9 +81,9 @@ void app_main(void)
     esp_err_t radio_result=ESP_ERR_INVALID_STATE;
     early_boot=false;
 #ifdef OFT_CABAC32
-    const unsigned required_tests=79;
+    const unsigned required_tests=81;
 #else
-    const unsigned required_tests=78;
+    const unsigned required_tests=80;
 #endif
     if(board_result==ESP_OK&&Unity.NumberOfTests>=required_tests&&!Unity.TestFailures&&!Unity.TestIgnores){
         esp_err_t motion_result=oft_motion_start();
@@ -134,7 +136,7 @@ void app_main(void)
                 if(!discard_command && strcmp(command,"video-off")==0)oft_video_stop_refresh();
                 /* UI lifecycle diagnostics: switch pages only; never press Hold
                    or generate nonzero motion input. Uses the normal mode path. */
-                if(!discard_command && strcmp(command,"video-show")==0)oft_udp_head_mode(true);
+                if(!discard_command && strcmp(command,"video-show")==0){oft_ui_preview_enabled(true);oft_udp_head_mode(true);}
                 if(!discard_command && strcmp(command,"ble-scan")==0)oft_ble_rescan();
                 if(!discard_command && strcmp(command,"gauge-audit")==0)printf("OFT_GAUGE request=audit accepted=%d\n",oft_gauge_request(OFT_GAUGE_AUDIT));
                 if(!discard_command && strcmp(command,"gauge-access")==0)printf("OFT_GAUGE request=access_restore accepted=%d\n",oft_gauge_request(OFT_GAUGE_ACCESS_RESTORE));
@@ -154,7 +156,7 @@ void app_main(void)
                 if(!discard_command && strcmp(command,"settings-mode-video")==0)printf("OFT_SETTINGS_MODE accepted=%d\n",oft_udp_setting(OFT_SET_MODE,1,0));
                 if(!discard_command && strcmp(command,"video-fresh")==0)oft_video_latency_mode(true);
                 if(!discard_command && strcmp(command,"video-balance")==0)oft_video_latency_mode(false);
-                if(!discard_command && strcmp(command,"video-hide")==0)oft_udp_head_mode(false);
+                if(!discard_command && strcmp(command,"video-hide")==0){oft_ui_preview_enabled(false);oft_udp_head_mode(false);}
                 if(!discard_command && strcmp(command,"video-trace-on")==0)printf("OFT_VIDEO_TRACE armed=%d\n",oft_video_trace_arm());
                 if(!discard_command && strcmp(command,"video-trace")==0)oft_video_trace_dump();
                 if(!discard_command && strcmp(command,"video-bench")==0)printf("OFT_BENCH_REQUEST accepted=%d\n",oft_video_benchmark());
@@ -194,6 +196,8 @@ void app_main(void)
             }
         }
         if(run_dump)oft_video_dump();
+        oft_alloc_diag_dump();
+        oft_network_tx_diag_dump();
         static oft_video_snapshot_t preview;oft_video_snapshot(&preview);
         static oft_udp_snapshot_t video_udp;oft_udp_snapshot(&video_udp);
         printf("OFT_MEMORY psram_mhz=%d cpu_mhz=%d\n",CONFIG_SPIRAM_SPEED,CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
@@ -213,6 +217,8 @@ void app_main(void)
         printf("OFT_VIDEO_REFRESH requests=%u replies=%u failures=%u completed=%u auto=%d pending=%d\n",
             video_udp.keyframe_requests,video_udp.keyframe_replies,video_udp.keyframe_failures,
             preview.refresh_completed,preview.sparse_live,video_udp.keyframe_pending);
+        printf("OFT_VIDEO_REPLY_STATE confirmed_request=%u timeouts=%u timeout_request=%u remote_timeouts=%u\n",
+            video_udp.keyframe_confirmed_request,video_udp.keyframe_timeouts,video_udp.keyframe_timeout_request,video_udp.keyframe_remote_timeouts);
         printf("OFT_VIDEO_CODEC slice=%u ref=%u intra=%u idr=%u nonref=%u stack_free=%u internal_free=%u source_age_ms=%u\n",preview.slice_type,preview.nal_reference,preview.intra_units,preview.idr_units,preview.nonreference_units,preview.stack_free,(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),preview.source_age_ms);
         printf("OFT_VIDEO decoded=%u presented=%u errors=%u au_drops=%u pending=%u bytes=%u age_ms=%u decode_ms=%u convert_ms=%u fps_milli=%u\n",
             preview.decoded_frames,preview.presented_frames,preview.decode_errors,preview.au_queue_drops,
@@ -245,6 +251,8 @@ void app_main(void)
             udp.enable_count,udp.heartbeat_replies,udp.heartbeat_sent,udp.invalid_packets,udp.ambiguous_status,(unsigned)udp.stack_free);
         printf("OFT_UDP_CONTROL nonzero=%u zero=%u failures=%u probe_done=%d raw_candidates=%d,%d,%d\n",
             udp.nonzero_commands,udp.zero_commands,udp.control_failures,udp.probe_done,udp.gimbal_raw[0],udp.gimbal_raw[1],udp.gimbal_raw[2]);
+        printf("OFT_ACK_RETRY active=%d deferred=%u recovered=%u failures=%u errno=%d max_delay_us=%u\n",
+            udp.ack_retry_active,udp.ack_deferred,udp.ack_recovered,udp.ack_failures,udp.ack_last_errno,udp.max_ack_retry_us);
         if(udp.gimbal_updated_us){
             /* Bounded 1Hz raw snapshot outside the network callback. Preserve
                unknown fields, not just the currently selected candidates. */
@@ -255,7 +263,7 @@ void app_main(void)
             char hex[193];for(unsigned i=0;i<udp.gimbal_status_size[s];i++)snprintf(hex+i*2,3,"%02x",udp.gimbal_status_frame[s][i]);
             printf("OFT_GIMBAL_STATUS us=%lld duml=%s\n",(long long)udp.gimbal_status_us[s],hex);
         }
-        printf("OFT_UDP_STOP receipt=%d first_zero_delay_us=%u\n",udp.zero_receipt_confirmed,(unsigned)udp.first_zero_delay_us);
+        printf("OFT_UDP_STOP receipt=%d receipt_us=%lld first_zero_delay_us=%u\n",udp.zero_receipt_confirmed,(long long)udp.zero_receipt_us,(unsigned)udp.first_zero_delay_us);
         printf("OFT_INPUT live=%d state=%u mock_commands=%u mock_zeros=%u actions=%u\n",udp.live_enabled,udp.control_state,udp.mock_commands,udp.mock_zeros,udp.action_count);
         printf("OFT_HEAD mode=%d held=%d sensor_ready=%d relative_deg=%.3f,%.3f tracking=%d trial_clamped=%d camera_deg=%.3f,%.3f target_deg=%.3f,%.3f physical_gain_validated=0\n",udp.head_mode,udp.head_held,udp.head_sensor_ready,(double)udp.head_yaw_deg,(double)udp.head_pitch_deg,
             udp.head_tracking,udp.head_trial_guard,(double)udp.head_camera_yaw,(double)udp.head_camera_pitch,(double)udp.head_target_yaw,(double)udp.head_target_pitch);

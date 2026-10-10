@@ -17,6 +17,7 @@ extern "C" {
 }
 #include "wels/codec_api.h"
 #include "oft_profile.h"
+#include "oft_decode_limits.h"
 #include "cabac32.h"
 #include <atomic>
 #include <cstdio>
@@ -29,6 +30,7 @@ extern "C" {
 #endif
 
 static constexpr size_t AU_CAP=262144,QUEUED_CAP=256*1024;
+static_assert(QUEUED_CAP<=OFT_H264_INPUT_CAPACITY,"AU queue budget exceeds initial decoder input capacity");
 static constexpr unsigned DW=352,DH=198,RGB_BYTES=DW*DH*2;
 struct Packet {int64_t at;uint32_t hash;uint16_t size;uint8_t bytes[1472];};
 struct Unit {uint8_t *data;size_t size;int64_t at;unsigned epoch;bool idr;};
@@ -96,6 +98,7 @@ extern "C" void oft_video_latency_mode(bool fresh){fresh_mode=fresh;wake_refresh
 static bool gui_refresh,previous_visible;
 static unsigned missed_picture;
 static unsigned recovery_level;
+static unsigned ack_timeout_retries;
 static std::atomic<unsigned> simulated_losses{0};
 static std::atomic<int64_t> burst_until{0};
 static std::atomic<unsigned> trial_burst_maximum{3};
@@ -128,20 +131,22 @@ extern "C" bool oft_video_loss_test(void)
 }
 static unsigned image_backoff_ms(unsigned level)
 {return level>=3?30000u:(4000u<<level);}
+static unsigned ack_timeout_delay_ms(unsigned attempts)
+{return attempts<3?image_backoff_ms(attempts):0;}
 static bool retry_image_only(const oft_udp_snapshot_t &u,unsigned requests,bool gui,bool shown)
 {
-    return gui&&shown&&u.state==OFT_UDP_READY&&!u.keyframe_failures&&!u.keyframe_pending&&
-        u.keyframe_requests>requests&&u.keyframe_replies==u.keyframe_requests;
+    return gui&&shown&&u.state==OFT_UDP_READY&&!u.keyframe_failures&&!u.keyframe_pending&&!u.action_busy&&!u.ack_retry_active&&
+        u.keyframe_requests>requests&&(u.keyframe_confirmed_request==u.keyframe_requests||u.keyframe_timeout_request==u.keyframe_requests);
 }
 static bool refresh_success(const oft_udp_snapshot_t &u,const oft_video_snapshot_t &s,unsigned requests,uint32_t generation)
 {return u.state==OFT_UDP_READY&&!u.keyframe_failures&&u.keyframe_requests>requests&&
-    u.keyframe_replies==u.keyframe_requests&&s.last_idr_generation!=generation&&s.last_idr_source_us>u.keyframe_sent_us;}
+    u.keyframe_confirmed_request==u.keyframe_requests&&s.last_idr_generation!=generation&&s.last_idr_source_us>u.keyframe_sent_us;}
 static bool recover_missing(const oft_udp_snapshot_t &u,const oft_video_snapshot_t &s,
     unsigned requests,uint32_t generation,bool gui,unsigned missed,int64_t age)
 {
     bool known_loss=s.lost_idr_source_us>u.keyframe_sent_us&&age>=(int64_t)OFT_VIDEO_MIN_INTERVAL_MS*1000;
     return gui&&!missed&&(age>OFT_VIDEO_MISSING_TIMEOUT_US||known_loss)&&!s.busy&&u.state==OFT_UDP_READY&&!u.keyframe_failures&&
-        u.keyframe_requests>requests&&u.keyframe_replies==u.keyframe_requests&&
+        u.keyframe_requests>requests&&u.keyframe_confirmed_request==u.keyframe_requests&&
         !refresh_success(u,s,requests,generation);
 }
 static bool begin_refresh(unsigned interval_ms)
@@ -153,12 +158,12 @@ static bool begin_refresh(unsigned interval_ms)
     refresh_remaining=interval_ms?11:0;refresh_interval=interval_ms?interval_ms:5000;
     refresh_generation=s.last_idr_generation;refresh_request_count=u.keyframe_requests;
     refresh_wait=esp_timer_get_time();sparse=true;
-    missed_picture=0;recovery_level=0;
+    missed_picture=0;recovery_level=0;ack_timeout_retries=0;
     portENTER_CRITICAL(&mux);view.sparse_live=interval_ms!=0;view.refresh_interval_ms=refresh_interval;view.refresh_failures=0;view.refresh_recovering=false;view.retry_after_ms=0;portEXIT_CRITICAL(&mux);
     return true;
 }
 static void stop_refresh()
-{refresh_remaining=0;refresh_wait=0;recovery_level=0;simulated_losses=0;oft_udp_cancel_keyframe();portENTER_CRITICAL(&mux);view.sparse_live=false;view.refresh_recovering=false;view.retry_after_ms=0;portEXIT_CRITICAL(&mux);}
+{refresh_remaining=0;refresh_wait=0;recovery_level=0;ack_timeout_retries=0;simulated_losses=0;oft_udp_cancel_keyframe();portENTER_CRITICAL(&mux);view.sparse_live=false;view.refresh_recovering=false;view.retry_after_ms=0;portEXIT_CRITICAL(&mux);}
 extern "C" bool oft_video_refresh(unsigned interval_ms)
 {
     if((interval_ms&&interval_ms<OFT_VIDEO_MIN_INTERVAL_MS)||interval_ms>60000)return false;
@@ -186,8 +191,8 @@ extern "C" void oft_video_poll(void)
     }
     if(command==-2){stop_refresh();gui_refresh=false;}
     if(command>=0){
-        gui_refresh=false;
-        if(!begin_refresh((unsigned)command))printf("OFT_VIDEO_REQUEST rejected_by_scheduler=1\n");
+        if(begin_refresh((unsigned)command))gui_refresh=false;
+        else printf("OFT_VIDEO_REQUEST rejected_by_scheduler=1\n");
     }
     if((refresh_wait||refresh_remaining)&&(u.state!=OFT_UDP_READY||u.keyframe_failures)){
         stop_refresh();gui_refresh=false;
@@ -208,24 +213,31 @@ extern "C" void oft_video_poll(void)
             stop_refresh();gui_refresh=false;portENTER_CRITICAL(&mux);view.refresh_failures++;portEXIT_CRITICAL(&mux);
             detail("VIDEO refresh failed; automatic requests stopped");
         }else if(received){
-            missed_picture=0;recovery_level=0;
+            missed_picture=0;recovery_level=0;ack_timeout_retries=0;
             refresh_wait=0;refresh_due=u.keyframe_sent_us+(int64_t)refresh_interval*1000;
             portENTER_CRITICAL(&mux);view.refresh_completed++;view.refresh_recovering=false;view.retry_after_ms=0;portEXIT_CRITICAL(&mux);
             printf("OFT_VIDEO_REFRESH success=%u generation=%lu source_delay_ms=%lld hash=%08lx\n",s.refresh_completed+1,(unsigned long)s.last_idr_generation,(long long)((s.last_idr_frame_us-u.keyframe_sent_us)/1000),(unsigned long)s.last_idr_hash);
-        }else if(now-refresh_wait>OFT_VIDEO_MISSING_TIMEOUT_US){
-            if(retry_image_only(u,refresh_request_count,gui_refresh,shown)){
-                unsigned delay=image_backoff_ms(recovery_level);if(recovery_level<3)recovery_level++;
+        }else if(now-refresh_wait>OFT_VIDEO_MISSING_TIMEOUT_US||
+                 (u.keyframe_requests>refresh_request_count&&u.keyframe_timeout_request==u.keyframe_requests&&!u.keyframe_pending)){
+            bool ack_timeout=u.keyframe_requests>refresh_request_count&&u.keyframe_timeout_request==u.keyframe_requests;
+            unsigned timeout_delay=ack_timeout_delay_ms(ack_timeout_retries);
+            if(gui_refresh&&shown&&u.state==OFT_UDP_READY&&!u.keyframe_failures&&(u.action_busy||u.ack_retry_active)){
+                /* Leave control/ACK recovery to its owner; issue no new video request. */
+            }else if(retry_image_only(u,refresh_request_count,gui_refresh,shown)&&(!ack_timeout||timeout_delay)){
+                unsigned delay=ack_timeout?timeout_delay:image_backoff_ms(recovery_level);
+                if(ack_timeout)ack_timeout_retries++;else if(recovery_level<3)recovery_level++;
                 refresh_wait=0;refresh_due=now+(int64_t)delay*1000;refresh_remaining=UINT32_MAX;
                 missed_picture=1; // No new fast-retry loop until a real image arrives.
                 portENTER_CRITICAL(&mux);view.refresh_recovering=true;view.retry_after_ms=delay;view.refresh_recoveries++;portEXIT_CRITICAL(&mux);
-                detail("Image missing; backing off (control remains independent)");
-                printf("OFT_VIDEO_REFRESH backoff_ms=%u matched_ack=1\n",delay);
+                detail(ack_timeout?"Video ACK timeout; retrying with backoff":"Image missing; backing off (control remains independent)");
+                printf("OFT_VIDEO_REFRESH backoff_ms=%u matched_ack=%d timeout_retries=%u\n",delay,!ack_timeout,ack_timeout_retries);
             }else{
+                bool exhausted=ack_timeout&&ack_timeout_retries>=3;
                 stop_refresh();gui_refresh=false;portENTER_CRITICAL(&mux);view.refresh_failures++;portEXIT_CRITICAL(&mux);
-                detail("VIDEO request failed; automatic requests stopped");
+                detail(exhausted?"VIDEO ACK timeout retry limit reached":"VIDEO request failed; automatic requests stopped");
             }
         }
-    }else if(refresh_remaining&&now>=refresh_due&&!u.action_busy&&!s.busy&&!s.queued_units){
+    }else if(refresh_remaining&&now>=refresh_due&&!u.action_busy&&!u.ack_retry_active&&!s.busy&&!s.queued_units){
         if(oft_udp_keyframe()){
             reassembly_reset.store(true);
             if(refresh_remaining!=UINT32_MAX)refresh_remaining--;
@@ -543,11 +555,14 @@ static void test_conversion_mapping_is_bit_exact(void)
 static void test_video_refresh_correlates_reply_and_picture(void)
 {
     oft_udp_snapshot_t u{};oft_video_snapshot_t s{};u.state=OFT_UDP_READY;
-    u.keyframe_requests=u.keyframe_replies=1;u.keyframe_sent_us=100;s.last_idr_generation=2;s.last_idr_source_us=101;
+    u.keyframe_requests=u.keyframe_confirmed_request=1;u.keyframe_sent_us=100;s.last_idr_generation=2;s.last_idr_source_us=101;
     TEST_ASSERT_TRUE(refresh_success(u,s,0,1));
     s.last_idr_source_us=99;s.generation=3;s.last_source_us=105;TEST_ASSERT_FALSE(refresh_success(u,s,0,1));s.last_idr_source_us=101;
-    u.keyframe_replies=0;TEST_ASSERT_FALSE(refresh_success(u,s,0,1));u.keyframe_replies=1;
+    u.keyframe_confirmed_request=0;TEST_ASSERT_FALSE(refresh_success(u,s,0,1));u.keyframe_confirmed_request=1;
     u.keyframe_failures=1;TEST_ASSERT_FALSE(refresh_success(u,s,0,1));u.keyframe_failures=0;
+    u.keyframe_requests=u.keyframe_confirmed_request=6;u.keyframe_replies=5;
+    TEST_ASSERT_TRUE(refresh_success(u,s,5,1));
+    u.keyframe_confirmed_request=5;TEST_ASSERT_FALSE(refresh_success(u,s,5,1));
     u.state=OFT_UDP_FAULT;TEST_ASSERT_FALSE(refresh_success(u,s,0,1));
 }
 static void test_video_refresh_rejects_fast_rate(void)
@@ -573,14 +588,14 @@ static void test_psram_pattern_integrity(void)
 static void test_video_missing_picture_recovery_is_bounded(void)
 {
     oft_udp_snapshot_t u{};oft_video_snapshot_t s{};u.state=OFT_UDP_READY;
-    u.keyframe_requests=u.keyframe_replies=1;u.keyframe_sent_us=100;s.last_idr_generation=1;
+    u.keyframe_requests=u.keyframe_confirmed_request=1;u.keyframe_sent_us=100;s.last_idr_generation=1;
     TEST_ASSERT_TRUE(recover_missing(u,s,0,1,true,0,8000001));
     TEST_ASSERT_FALSE(recover_missing(u,s,0,1,true,1,8000001));
     TEST_ASSERT_FALSE(recover_missing(u,s,0,1,false,0,8000001));
     TEST_ASSERT_FALSE(recover_missing(u,s,0,1,true,0,8000000));
     TEST_ASSERT_FALSE(recover_missing(u,s,1,1,true,0,8000001));
-    u.keyframe_replies=0;TEST_ASSERT_FALSE(recover_missing(u,s,0,1,true,0,8000001));
-    u.keyframe_replies=1;s.last_idr_generation=2;s.last_idr_source_us=101;
+    u.keyframe_confirmed_request=0;TEST_ASSERT_FALSE(recover_missing(u,s,0,1,true,0,8000001));
+    u.keyframe_confirmed_request=1;s.last_idr_generation=2;s.last_idr_source_us=101;
     TEST_ASSERT_FALSE(recover_missing(u,s,0,1,true,0,8000001));
     s.last_idr_generation=1;s.lost_idr_source_us=101;
     TEST_ASSERT_TRUE(recover_missing(u,s,0,1,true,0,(int64_t)OFT_VIDEO_MIN_INTERVAL_MS*1000));
@@ -591,15 +606,19 @@ static void test_video_missing_picture_recovery_is_bounded(void)
 }
 static void test_image_retry_requires_healthy_reply_and_page(void)
 {
-    oft_udp_snapshot_t u{};u.state=OFT_UDP_READY;u.keyframe_requests=u.keyframe_replies=4;
+    oft_udp_snapshot_t u{};u.state=OFT_UDP_READY;u.keyframe_requests=u.keyframe_confirmed_request=4;
     u.head_held=true;u.control_state=OFT_CONTROL_ACTIVE;
     TEST_ASSERT_TRUE(retry_image_only(u,3,true,true)); // Holding must not stop video.
     TEST_ASSERT_FALSE(retry_image_only(u,3,false,true));
     TEST_ASSERT_FALSE(retry_image_only(u,3,true,false));
     TEST_ASSERT_FALSE(retry_image_only(u,4,true,true));
     u.keyframe_pending=true;TEST_ASSERT_FALSE(retry_image_only(u,3,true,true));u.keyframe_pending=false;
-    u.keyframe_replies=3;TEST_ASSERT_FALSE(retry_image_only(u,3,true,true));u.keyframe_replies=4;
+    u.keyframe_confirmed_request=3;TEST_ASSERT_FALSE(retry_image_only(u,3,true,true));u.keyframe_confirmed_request=4;
     u.keyframe_failures=1;TEST_ASSERT_FALSE(retry_image_only(u,3,true,true));u.keyframe_failures=0;
+    u.keyframe_confirmed_request=3;u.keyframe_timeout_request=4;u.keyframe_timeouts=1;
+    TEST_ASSERT_TRUE(retry_image_only(u,3,true,true));
+    u.action_busy=true;TEST_ASSERT_FALSE(retry_image_only(u,3,true,true));u.action_busy=false;
+    u.ack_retry_active=true;TEST_ASSERT_FALSE(retry_image_only(u,3,true,true));u.ack_retry_active=false;
     u.state=OFT_UDP_FAULT;TEST_ASSERT_FALSE(retry_image_only(u,3,true,true));
 }
 static void test_image_backoff_is_bounded(void)
@@ -607,6 +626,9 @@ static void test_image_backoff_is_bounded(void)
     TEST_ASSERT_EQUAL_UINT(4000,image_backoff_ms(0));TEST_ASSERT_EQUAL_UINT(8000,image_backoff_ms(1));
     TEST_ASSERT_EQUAL_UINT(16000,image_backoff_ms(2));TEST_ASSERT_EQUAL_UINT(30000,image_backoff_ms(3));
     TEST_ASSERT_EQUAL_UINT(30000,image_backoff_ms(UINT32_MAX));
+    TEST_ASSERT_EQUAL_UINT(4000,ack_timeout_delay_ms(0));TEST_ASSERT_EQUAL_UINT(8000,ack_timeout_delay_ms(1));
+    TEST_ASSERT_EQUAL_UINT(16000,ack_timeout_delay_ms(2));TEST_ASSERT_EQUAL_UINT(0,ack_timeout_delay_ms(3));
+    TEST_ASSERT_EQUAL_UINT(0,ack_timeout_delay_ms(UINT32_MAX));
 }
 static bool admit_sparse_picture(bool idr,bool vcl,unsigned kind,unsigned budget,bool &sync,unsigned &remaining)
 {
@@ -703,6 +725,15 @@ static void assembly_worker(void *)
         view.invalid=assembler.invalid+assembler.conflicts;view.lost_idr_source_us=assembler.lost_idr_source_us;view.lost_idrs=assembler.lost_idrs;portEXIT_CRITICAL(&mux);
         if(!n)continue;
         uint32_t mask=oft_media_nal_mask(au,n);
+        if(mask&(1u<<7)){
+            /* SPS starts with profile/constraint/level bytes. Inspect before
+               decode so decoder selection is based on the actual source. */
+            for(size_t i=0;i+6<n;i++)if(!au[i]&&!au[i+1]&&au[i+2]==1&&(au[i+3]&31)==7){
+                printf("OFT_VIDEO_SPS profile_idc=%u constraints=%02x level_idc=%u\n",
+                    (unsigned)au[i+4],(unsigned)au[i+5],(unsigned)au[i+6]);
+                break;
+            }
+        }
         unsigned ref=0,kind=9;bool vcl=oft_media_slice(au,n,&ref,&kind);
         portENTER_CRITICAL(&mux);view.slice_type=kind;view.nal_reference=ref;
         if(vcl&&kind==2)view.intra_units++;

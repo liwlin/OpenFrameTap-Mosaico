@@ -1,6 +1,6 @@
 # OpenFrameTap Mosaico
 
-This repository is the independent ESP-Mosaico V1.0 / ESP32-S31 firmware.
+This repository is the independent ESP-Mosaico V1.0 / V1.2 / ESP32-S31 firmware.
 Read README.md, docs/build.md and docs/development.md before changes.
 Do not deploy to ROCK 4D or import its Linux runtime as a dependency.
 

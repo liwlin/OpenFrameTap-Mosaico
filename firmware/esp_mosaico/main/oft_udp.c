@@ -6,6 +6,7 @@
 #include "oft_motion.h"
 #include "oft_video.h"
 #include "oft_video_policy.h"
+#include "oft_rx_queue.h"
 #include "esp_heap_caps.h"
 #include "oft_head_target.h"
 #include "oft_head_servo.h"
@@ -69,14 +70,24 @@ static float yaw_limit_shift;
 static uint16_t action_sequence;
 static int64_t action_deadline,action_cooldown;
 static int64_t disconnect_ble_due;
+static int64_t guard_stop_deadline;
 static int sock=-1;
 static oft_wifi_session_t wire;
 static oft_duml_stream_t parser;
 static uint8_t rx[OFT_WIFI_DATAGRAM_MAX+1];
 static uint16_t duml_counter,enable_sequence,heartbeat_sequence;
 static uint16_t last_zero_transport_sequence;
-static int64_t deadline,next_ack,next_presence,next_heartbeat,last_heartbeat_reply;
+static int64_t deadline,next_presence,next_heartbeat,last_heartbeat_reply;
+static oft_wifi_ack_tx_t ack_tx;
+static int ack_last_error;
 static oft_wifi_pending_t pending_heartbeats;
+/* Fixed-size diagnostics, owned only by this UDP task; no media/credentials. */
+static struct {
+    int64_t recv_us,status_us,media_us,ack_us,heartbeat_us;
+    uint8_t status[34],ack[34];
+    unsigned status_size,ack_size;
+    uint16_t heartbeat_sequence;
+} session_diag;
 static bool registered81,enabled;
 static uint16_t registration_seq[2];static bool seen_registration[2];
 static bool probe_running,probe_zeros_pending;
@@ -90,6 +101,11 @@ static bool attempted; /* exactly one UDP session per Wi-Fi association */
 static oft_control_t control;
 static oft_control_t mock_control;
 static const char *TAG="oft_udp";
+static bool guard_stop_receipt_ready(void)
+{
+    return view.zero_receipt_confirmed&&(!guard_stop_deadline||
+        (view.zero_receipt_us>0&&view.zero_receipt_us<=guard_stop_deadline));
+}
 void oft_udp_settings_snapshot(oft_settings_snapshot_t *out)
 {portENTER_CRITICAL(&mux);*out=settings;if(view.state!=OFT_UDP_READY)memset(&out->values,0,sizeof(out->values));portEXIT_CRITICAL(&mux);}
 void oft_udp_settings_refresh(void){atomic_store(&settings_refresh,true);}
@@ -132,7 +148,7 @@ bool oft_udp_shutter(int64_t at)
 bool oft_udp_keyframe(void)
 {
     oft_udp_snapshot_t s;oft_udp_snapshot(&s);int64_t now=esp_timer_get_time();
-    if(s.state!=OFT_UDP_READY||s.action_busy||s.keyframe_pending||s.keyframe_failures||
+    if(s.state!=OFT_UDP_READY||s.action_busy||s.ack_retry_active||s.keyframe_pending||s.keyframe_failures||
        now-s.started_us<5000000||(s.keyframe_sent_us&&now-s.keyframe_sent_us<(int64_t)OFT_VIDEO_MIN_INTERVAL_MS*1000))return false;
     bool expected=false;return atomic_compare_exchange_strong(&keyframe_requested,&expected,true);
 }
@@ -142,7 +158,8 @@ void oft_udp_stop(void){atomic_store(&stop_requested,true);}
 void oft_udp_disconnect(void){atomic_store(&disconnect_requested,true);}
 void oft_udp_head_mode(bool head)
 {
-    portENTER_CRITICAL(&mux);memset(&latest_input,0,sizeof(latest_input));requested_head_hold=false;head_input_us=0;portEXIT_CRITICAL(&mux);
+    int64_t now=esp_timer_get_time();
+    portENTER_CRITICAL(&mux);latest_input=(oft_input_t){.timestamp_us=now};requested_head_hold=false;head_input_us=now;portEXIT_CRITICAL(&mux);
     oft_motion_haptic(false);atomic_store(&mode_request,head?1:0);
 }
 void oft_udp_head_hold(bool held,bool new_press)
@@ -174,9 +191,27 @@ static bool transmit(const uint8_t *data,size_t n)
 {
     if(sock<0||!n)return false;
     ssize_t sent=send(sock,data,n,MSG_DONTWAIT);
+    int error=sent<0?errno:0;
     if(sent!=(ssize_t)n)ESP_LOGE(TAG,"send_failed bytes=%u sent=%d errno=%d internal_free=%u largest=%u",
-        (unsigned)n,(int)sent,errno,(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        (unsigned)n,(int)sent,error,(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return sent==(ssize_t)n;
+}
+static oft_wifi_ack_send_result_t send_flow_ack(const uint8_t *data,size_t n,void *unused)
+{
+    (void)unused;
+    if(sock<0||n!=34){ack_last_error=EINVAL;return OFT_WIFI_ACK_SEND_FATAL;}
+    ssize_t sent=send(sock,data,n,MSG_DONTWAIT);
+    ack_last_error=sent<0?errno:0;
+    oft_wifi_ack_send_result_t result=oft_wifi_ack_classify_send((int)sent,ack_last_error);
+    if(result==OFT_WIFI_ACK_SEND_OK){
+        memcpy(session_diag.ack,data,n);session_diag.ack_size=(unsigned)n;
+        session_diag.ack_us=esp_timer_get_time();
+    }
+    if(result!=OFT_WIFI_ACK_SEND_OK&&(!ack_tx.retrying||result==OFT_WIFI_ACK_SEND_FATAL))
+        ESP_LOGW(TAG,"flow_ack_send_failed sent=%d errno=%d internal_free=%u largest=%u",
+            (int)sent,ack_last_error,(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return result;
 }
 static bool profile(oft_p3_command_t cmd,int yaw,int pitch,uint16_t *seq_out)
 {
@@ -197,7 +232,7 @@ static bool profile(oft_p3_command_t cmd,int yaw,int pitch,uint16_t *seq_out)
     portENTER_CRITICAL(&mux);view.commands++;
     if(cmd==OFT_P3_STICK){
         if(yaw||pitch)view.nonzero_commands++;
-        else {view.zero_commands++;view.zero_receipt_confirmed=false;last_zero_transport_sequence=wire.last_sent;}
+        else {view.zero_commands++;view.zero_receipt_confirmed=false;view.zero_receipt_us=0;last_zero_transport_sequence=wire.last_sent;}
     }
     portEXIT_CRITICAL(&mux);
     if(cmd==OFT_P3_STICK){
@@ -382,6 +417,13 @@ static bool mock_send(int y,int p,void *unused)
 }
 static void close_session(bool fault,const char *detail)
 {
+    int64_t fault_at_us=esp_timer_get_time();
+    oft_wifi_session_t fault_wire=wire;
+    oft_wifi_pending_t waiting=pending_heartbeats;
+    bool frame_wait=keyframe_pending,ack_retry=ack_tx.retrying;
+    guard_stop_deadline=0;
+    ack_tx=(oft_wifi_ack_tx_t){0};
+    portENTER_CRITICAL(&mux);view.ack_retry_active=false;portEXIT_CRITICAL(&mux);
     if(probe_priming||probe_running||probe_zeros_pending||control.stop_required){
         probe_zeros_pending=true;
         oft_control_stop(&control,true,esp_timer_get_time(),control_send,NULL);
@@ -400,6 +442,25 @@ static void close_session(bool fault,const char *detail)
     if(sock>=0){close(sock);sock=-1;}
     portENTER_CRITICAL(&mux);memset(&latest_input,0,sizeof(latest_input));requested_head_hold=false;view.head_held=false;view.live_enabled=false;view.action_busy=false;view.probe_running=false;view.control_state=fault?OFT_CONTROL_FAULT:OFT_CONTROL_DISABLED;portEXIT_CRITICAL(&mux);
     atomic_store(&probe_request,-1);state(fault?OFT_UDP_FAULT:OFT_UDP_OFF,detail);
+    /* Print only after existing stop/close paths; diagnostics must not delay
+       the first neutral command or inspect an undocumented driver ABI. */
+    if(fault){
+        oft_rx_queue_stats_t q=oft_rx_queue_stats();
+        printf("OFT_UDP_FAULT us=%lld session=%u recv_us=%lld packet_us=%lld status_received_us=%lld media_us=%lld heartbeat_matched_us=%lld heartbeat_seq=%u ack_send_accepted_us=%lld ack_retry=%d keyframe_pending=%d keyframe_seq=%u keyframe_deadline_us=%lld reason=%s\n",
+            (long long)fault_at_us,fault_wire.session,(long long)session_diag.recv_us,(long long)view.last_packet_us,
+            (long long)session_diag.status_us,(long long)session_diag.media_us,(long long)session_diag.heartbeat_us,
+            session_diag.heartbeat_sequence,(long long)session_diag.ack_us,ack_retry,frame_wait,keyframe_sequence,(long long)keyframe_deadline,detail);
+        printf("OFT_UDP_FAULT_WIRE sent=%u peer=%u media=%u reply=%u pending=%d:%u,%d:%u,%d:%u,%d:%u rx_posts=%u rx_drops=%u rx_high=%u\n",
+            fault_wire.last_sent,fault_wire.peer,fault_wire.media_received,fault_wire.reply_received,
+            waiting.used[0],waiting.sequence[0],waiting.used[1],waiting.sequence[1],
+            waiting.used[2],waiting.sequence[2],waiting.used[3],waiting.sequence[3],q.posts,q.drops,q.high_water);
+        char status_hex[69],ack_hex[69];
+        for(unsigned i=0;i<session_diag.status_size;i++)snprintf(status_hex+i*2,3,"%02x",session_diag.status[i]);
+        status_hex[session_diag.status_size*2]=0;
+        for(unsigned i=0;i<session_diag.ack_size;i++)snprintf(ack_hex+i*2,3,"%02x",session_diag.ack[i]);
+        ack_hex[session_diag.ack_size*2]=0;
+        printf("OFT_UDP_FAULT_HEADERS status=%s ack=%s\n",status_hex,ack_hex);
+    }
 }
 static bool reply(const oft_duml_frame_t *f,uint8_t sender,uint8_t set,uint8_t id,uint16_t seq)
 {return f->sender==sender&&f->receiver==2&&f->cmd_set==set&&f->cmd_id==id&&f->sequence==seq&&(f->flags==0x80||f->flags==0xc0);}
@@ -472,9 +533,20 @@ static void frame_received(const oft_duml_frame_t *f,void *unused)
     }
     if(keyframe_pending&&reply(f,0x41,9,0xa8,keyframe_sequence)){
         log_duml("video_09_a8_rx",f->raw,f->raw_size);keyframe_pending=false;
+        /* Observed Pocket3 E1 matches DJI's public camera timeout code, but
+           its per-command spec is unavailable. Keep this a failed request:
+           only the existing bounded preview-timeout recovery may retry it. */
+        bool remote_timeout=f->payload_size==1&&f->payload[0]==0xe1;
         portENTER_CRITICAL(&mux);view.keyframe_pending=false;
-        if(f->payload_size==1&&!f->payload[0])view.keyframe_replies++;else view.keyframe_failures++;
+        if(f->payload_size==1&&!f->payload[0]){view.keyframe_replies++;view.keyframe_confirmed_request=view.keyframe_requests;}
+        else if(remote_timeout){
+            view.keyframe_timeouts++;view.keyframe_remote_timeouts++;
+            view.keyframe_timeout_request=view.keyframe_requests;
+        }
+        else view.keyframe_failures++;
         portEXIT_CRITICAL(&mux);
+        if(remote_timeout)ESP_LOGW(TAG,"video_remote_timeout request=%u seq=%u code=e1 elapsed_us=%lld",
+            view.keyframe_requests,f->sequence,(long long)(esp_timer_get_time()-view.keyframe_sent_us));
     }
     if(view.state==OFT_UDP_ENABLE&&reply(f,0x41,9,0xa8,enable_sequence)){
         if(f->payload_size!=1||f->payload[0]){close_session(true,"Normal-view enable rejected");return;}
@@ -484,11 +556,16 @@ static void frame_received(const oft_duml_frame_t *f,void *unused)
     if(f->sender==4&&f->cmd_set==4&&f->cmd_id==0x50)
         ESP_LOGI(TAG,"keepalive_rx seq=%u flags=%02x payload_bytes=%u",f->sequence,f->flags,(unsigned)f->payload_size);
     if(reply(f,4,4,0x50,f->sequence)&&oft_wifi_pending_take(&pending_heartbeats,f->sequence)){
-        static const uint8_t expected[]={0,1,4,1,0,5,1,1};
-        if(f->payload_size!=sizeof(expected)||memcmp(f->payload,expected,sizeof(expected))){close_session(true,"Unexpected control keepalive response");return;}
+        if(!oft_p3_control_heartbeat_payload_valid(f->payload,f->payload_size)){
+            log_duml("unexpected_keepalive_response",f->raw,f->raw_size);
+            close_session(true,"Unexpected control keepalive response");return;
+        }
         last_heartbeat_reply=esp_timer_get_time();
+        session_diag.heartbeat_us=last_heartbeat_reply;
+        session_diag.heartbeat_sequence=f->sequence;
         portENTER_CRITICAL(&mux);view.heartbeat_replies++;portEXIT_CRITICAL(&mux);
         if(view.state==OFT_UDP_ENABLE){
+            log_duml("initial_control_keepalive_response",f->raw,f->raw_size);
             if(OFT_P3_TOUCH_CONTROL_VALIDATED){
                 arm_pending=true;arm_zero_count=0;arm_due=esp_timer_get_time();arm_settle=0;deadline=arm_due+2500000;
                 state(OFT_UDP_ARMING,"Preparing controls; release the joystick");
@@ -507,6 +584,9 @@ static void frame_received(const oft_duml_frame_t *f,void *unused)
 }
 static void open_session(const char *ip)
 {
+    memset(&session_diag,0,sizeof(session_diag));
+    guard_stop_deadline=0;
+    ack_tx=(oft_wifi_ack_tx_t){0};ack_last_error=0;
     portENTER_CRITICAL(&mux);memset(&settings,0,sizeof(settings));setting_request.at=0;portEXIT_CRITICAL(&mux);
     memset(&setting_tx,0,sizeof(setting_tx));subscription_cursor=0;subscription_due=0;setting_send_due=0;rejected_subscriptions=0;memset(subscription_sequences,0,sizeof(subscription_sequences));atomic_store(&settings_refresh,false);
     shutter=(oft_shutter_tx_t){0};shutter_cooldown=0;atomic_store(&shutter_request,0);
@@ -547,9 +627,14 @@ static void receive_packet(const uint8_t *p,size_t n)
     if(!oft_wifi_parse(p,n,&v)||v.session!=wire.session){portENTER_CRITICAL(&mux);view.invalid_packets++;portEXIT_CRITICAL(&mux);return;}
     int64_t now=esp_timer_get_time();
     portENTER_CRITICAL(&mux);view.packets++;view.bytes+=n;view.last_packet_us=now;portEXIT_CRITICAL(&mux);
+    if(v.type==1){
+        session_diag.status_us=now;
+        session_diag.status_size=n<sizeof(session_diag.status)?(unsigned)n:sizeof(session_diag.status);
+        memcpy(session_diag.status,p,session_diag.status_size);
+    }
     if(view.state==OFT_UDP_HANDSHAKE){
         if(!oft_wifi_handshake_accepted(&wire,p,n))return;
-        state(OFT_UDP_REGISTER,"Registering application");deadline=now+5000000;next_ack=now;next_presence=now+1000000;
+        state(OFT_UDP_REGISTER,"Registering application");deadline=now+5000000;ack_tx.next_due_us=now;next_presence=now+1000000;
         if(!profile(OFT_P3_OPEN,0,0,NULL)||!profile(OFT_P3_PRESENCE,0,0,NULL))close_session(true,"Application open failed");
         return;
     }
@@ -557,8 +642,8 @@ static void receive_packet(const uint8_t *p,size_t n)
     if(!oft_wifi_observe(&wire,p,n)){
         portENTER_CRITICAL(&mux);view.ambiguous_status++;portEXIT_CRITICAL(&mux);return;
     }
-    if(v.type==1&&view.zero_commands&&(uint16_t)(wire.peer-last_zero_transport_sequence)<0x8000){
-        portENTER_CRITICAL(&mux);view.zero_receipt_confirmed=true;portEXIT_CRITICAL(&mux);
+    if(v.type==1&&view.zero_commands&&!view.zero_receipt_confirmed&&(uint16_t)(wire.peer-last_zero_transport_sequence)<0x8000){
+        portENTER_CRITICAL(&mux);view.zero_receipt_confirmed=true;view.zero_receipt_us=now;portEXIT_CRITICAL(&mux);
     }
     oft_duml_frame_t direct;
     if(oft_wifi_direct_duml(&v,&direct)){
@@ -566,7 +651,7 @@ static void receive_packet(const uint8_t *p,size_t n)
             ESP_LOGI(TAG,"direct keepalive wh_type=%u seq=%u",v.type,direct.sequence);
         frame_received(&direct,NULL);return;
     }
-    if(v.type==2){portENTER_CRITICAL(&mux);view.media_packets++;portEXIT_CRITICAL(&mux);oft_video_feed(p,n,now);return;}
+    if(v.type==2){session_diag.media_us=now;portENTER_CRITICAL(&mux);view.media_packets++;portEXIT_CRITICAL(&mux);oft_video_feed(p,n,now);return;}
     if(v.type==1||v.type==3){
         /* WhType03 is a device response, not an operator WhType05 envelope.
            The Python reference resynchronizes over the packet, not offset20. */
@@ -579,13 +664,29 @@ static void receive_packet(const uint8_t *p,size_t n)
 static void timers(int64_t now)
 {
     if(view.state<OFT_UDP_REGISTER||view.state==OFT_UDP_FAULT)return;
-    if(wire.have_status&&now>=next_ack){
-        uint8_t packet[40];size_t n=oft_wifi_ack(&wire,packet,sizeof(packet));
-        if(!transmit(packet,n)){close_session(true,"Flow ACK failed");return;}
-        portENTER_CRITICAL(&mux);
-        if(view.last_ack_us&&now-view.last_ack_us>view.max_ack_gap_us)view.max_ack_gap_us=(uint32_t)(now-view.last_ack_us);
-        view.last_ack_us=now;view.acks++;portEXIT_CRITICAL(&mux);
-        next_ack+=25000;if(next_ack<=now)next_ack=now+25000;
+    if(wire.have_status){
+        bool recovering=ack_tx.retrying;int64_t first_failure=ack_tx.first_failure_us;
+        oft_wifi_ack_step_result_t result=oft_wifi_ack_tx_step(&ack_tx,&wire,now,send_flow_ack,NULL);
+        if(result==OFT_WIFI_ACK_FAILED){
+            portENTER_CRITICAL(&mux);view.ack_failures++;view.ack_last_errno=ack_last_error;portEXIT_CRITICAL(&mux);
+            ESP_LOGE(TAG,"flow_ack_failed errno=%d retry_age_us=%lld",ack_last_error,
+                (long long)(recovering?now-first_failure:0));
+            close_session(true,"Flow ACK failed");return;
+        }
+        if(result==OFT_WIFI_ACK_DEFERRED){
+            portENTER_CRITICAL(&mux);view.ack_deferred++;view.ack_last_errno=ack_last_error;
+            view.ack_retry_active=true;portEXIT_CRITICAL(&mux);
+        }else if(result==OFT_WIFI_ACK_SENT){
+            uint32_t delay=recovering?(uint32_t)(now-first_failure):0;
+            portENTER_CRITICAL(&mux);
+            if(view.last_ack_us&&now-view.last_ack_us>view.max_ack_gap_us)view.max_ack_gap_us=(uint32_t)(now-view.last_ack_us);
+            view.last_ack_us=now;view.acks++;view.ack_retry_active=false;
+            if(recovering){view.ack_recovered++;if(delay>view.max_ack_retry_us)view.max_ack_retry_us=delay;}
+            portEXIT_CRITICAL(&mux);
+            if(recovering)ESP_LOGI(TAG,"flow_ack_recovered delay_us=%u",(unsigned)delay);
+        }
+        /* A deferred ACK never blocks heartbeat/deadline/arming or the input
+           watchdog. Only this cumulative, side-effect-free packet is retried. */
     }
     if(now>=next_presence){
         next_presence=now+1000000;if(!profile(OFT_P3_PRESENCE,0,0,NULL)){close_session(true,"APP presence failed");return;}
@@ -602,11 +703,16 @@ static void timers(int64_t now)
     if(action_pending&&now>=action_deadline){close_session(true,"Gimbal action ACK timeout");return;}
     if(keyframe_pending&&now>=keyframe_deadline){
         keyframe_pending=false;
-        portENTER_CRITICAL(&mux);view.keyframe_pending=false;view.keyframe_failures++;portEXIT_CRITICAL(&mux);
-        ESP_LOGW(TAG,"Keyframe ACK timeout; video retries disabled, controls retained");
+        portENTER_CRITICAL(&mux);view.keyframe_pending=false;view.keyframe_timeouts++;
+        view.keyframe_timeout_request=view.keyframe_requests;portEXIT_CRITICAL(&mux);
+        ESP_LOGW(TAG,"Keyframe ACK timeout request=%u; image recovery eligible, controls retained",view.keyframe_requests);
     }
-    if(atomic_exchange(&keyframe_requested,false)&&view.state==OFT_UDP_READY&&!action_pending&&!keyframe_pending&&
-       !view.keyframe_failures&&now-view.started_us>=5000000&&(!view.keyframe_sent_us||now-view.keyframe_sent_us>=(int64_t)OFT_VIDEO_MIN_INTERVAL_MS*1000)){
+    /* Consume the one-slot request only when it can actually be sent. A
+       temporary action/rate gate must not silently discard accepted work. */
+    if(view.state!=OFT_UDP_READY||view.keyframe_failures)atomic_store(&keyframe_requested,false);
+    if(!ack_tx.retrying&&view.state==OFT_UDP_READY&&!action_pending&&!keyframe_pending&&
+       !view.keyframe_failures&&now-view.started_us>=5000000&&(!view.keyframe_sent_us||now-view.keyframe_sent_us>=(int64_t)OFT_VIDEO_MIN_INTERVAL_MS*1000)&&
+       atomic_exchange(&keyframe_requested,false)){
         bool sent=profile(OFT_P3_ENABLE,0,0,&keyframe_sequence);
         portENTER_CRITICAL(&mux);view.keyframe_requests++;view.keyframe_sent_us=now;view.keyframe_pending=sent;
         if(!sent)view.keyframe_failures++;
@@ -674,12 +780,13 @@ static void manager(void *unused)
         if(disconnect_ble_due&&esp_timer_get_time()>=disconnect_ble_due){disconnect_ble_due=0;oft_ble_disconnect();}
         int mode=atomic_exchange(&mode_request,-1);
         if(mode>=0){
-            oft_control_stop(&control,false,esp_timer_get_time(),control_send,NULL);
+            bool guard_pause=oft_control_is_guard_fault(&control);
+            if(!guard_pause)oft_control_stop(&control,false,esp_timer_get_time(),control_send,NULL);
             head_reference_valid=false;head_hold_blocked=false;oft_motion_haptic(false);
             oft_head_target_cancel(&head_target);head_result=(oft_head_result_t){0};
-            portENTER_CRITICAL(&mux);view.head_mode=mode==1;view.head_held=false;view.head_limit_mask=0;memset(&latest_input,0,sizeof(latest_input));portEXIT_CRITICAL(&mux);
-            if(control.state==OFT_CONTROL_FAULT)close_session(true,"Cannot stop before mode change");
-            else oft_control_init(&control); /* cleared only AFTER successful stop */
+            portENTER_CRITICAL(&mux);view.head_mode=mode==1;view.head_held=false;view.head_limit_mask=0;latest_input=(oft_input_t){.timestamp_us=esp_timer_get_time()};portEXIT_CRITICAL(&mux);
+            if(control.state==OFT_CONTROL_FAULT&&!guard_pause)close_session(true,"Cannot stop before mode change");
+            else if(!guard_pause)oft_control_init(&control); /* Guard pause still requires release + stop receipt. */
         }
         if(yaw_anchor.pending){
             float center,shift;
@@ -745,6 +852,7 @@ static void manager(void *unused)
         for(unsigned batch=0;batch<64&&sock>=0;batch++){
             ssize_t n=recv(sock,rx,sizeof(rx),MSG_DONTWAIT);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK)close_session(true,"UDP receive failed");break;}
+            if(n>0)session_diag.recv_us=esp_timer_get_time();
             receive_packet(rx,(size_t)n);timers(esp_timer_get_time());
         }
         if(sock>=0){
@@ -782,11 +890,47 @@ static void manager(void *unused)
                    event must not look like a future timestamp and false-fault. */
                 int64_t input_now=esp_timer_get_time();
                 bool link_fresh=view.last_packet_us&&input_now-view.last_packet_us<=300000;
+                oft_input_t release=input;
+                if(view.head_mode){
+                    /* Use the physical hold/cancel event, not synthetic inactive servo output. */
+                    portENTER_CRITICAL(&mux);release.active=requested_head_hold;release.timestamp_us=head_input_us;portEXIT_CRITICAL(&mux);
+                }
+                if(oft_control_rearm_on_release(c,&release,!action_pending&&link_fresh&&guard_stop_receipt_ready(),input_now)){
+                    guard_stop_deadline=0;
+                    /* A release can arrive after HEAD output was computed. Never
+                       emit that cached active output on the rearm iteration. */
+                    input=(oft_input_t){.timestamp_us=input_now};
+                    if(view.head_mode){
+                        c->blocked_gesture=0x80000000u|head_generation;c->have_blocked_gesture=true;
+                        head_hold_blocked=true;head_reference_valid=false;oft_head_target_cancel(&head_target);head_result.active=false;
+                        atomic_store(&head_new_press,false);
+                    }
+                    portENTER_CRITICAL(&mux);strlcpy(view.detail,"LIVE ready / release to stop",sizeof(view.detail));portEXIT_CRITICAL(&mux);
+                    ESP_LOGI(TAG,"OFT_CONTROL_REARM release=1 stop_receipt=1 new_gesture_required=1");
+                }
+                int state_before=c->state;
                 oft_control_tick(c,&input,!action_pending&&link_fresh,input_now,OFT_P3_TOUCH_CONTROL_VALIDATED?control_send:mock_send,NULL);
                 portENTER_CRITICAL(&mux);view.control_state=c->state;portEXIT_CRITICAL(&mux);
-                if(OFT_P3_TOUCH_CONTROL_VALIDATED&&c->state==OFT_CONTROL_FAULT)close_session(true,"Input/link watchdog or send fault");
+                if(OFT_P3_TOUCH_CONTROL_VALIDATED&&c->state==OFT_CONTROL_FAULT){
+                    if(state_before!=OFT_CONTROL_FAULT)ESP_LOGW(TAG,"OFT_CONTROL_FAULT at_us=%lld link_fresh=%d action=%d input_age_us=%lld packet_age_us=%lld state_before=%d send_failures=%u",
+                            (long long)input_now,link_fresh,action_pending,(long long)(input_now-input.timestamp_us),
+                            (long long)(input_now-view.last_packet_us),state_before,c->failures);
+                    if(!oft_control_is_guard_fault(c))close_session(true,"Control send/stop failed");
+                    else{
+                        if(state_before!=OFT_CONTROL_FAULT){
+                            guard_stop_deadline=input_now+300000;
+                            head_hold_blocked=true;head_reference_valid=false;oft_head_target_cancel(&head_target);head_result.active=false;
+                            oft_motion_haptic(false);
+                            portENTER_CRITICAL(&mux);view.head_held=false;view.head_tracking=false;view.head_release_required=true;
+                            strlcpy(view.detail,"Control paused: release, then press again",sizeof(view.detail));portEXIT_CRITICAL(&mux);
+                            ESP_LOGW(TAG,"OFT_CONTROL_PAUSE neutral_sent=1 awaiting_receipt=1 video_retained=1");
+                        }
+                        if(guard_stop_receipt_ready())guard_stop_deadline=0;
+                        else if(guard_stop_deadline&&input_now>=guard_stop_deadline)close_session(true,"Control stop receipt timeout");
+                    }
+                }
                 int action=atomic_exchange(&action_request,-1);
-                if(action>=0&&OFT_P3_TOUCH_CONTROL_VALIDATED&&!action_pending&&now>=action_cooldown&&view.state==OFT_UDP_READY){
+                if(action>=0&&OFT_P3_TOUCH_CONTROL_VALIDATED&&!action_pending&&control.state!=OFT_CONTROL_FAULT&&now>=action_cooldown&&view.state==OFT_UDP_READY){
                     head_reference_valid=false;head_hold_blocked=true;
                     oft_motion_haptic(false);
                     oft_head_target_cancel(&head_target);head_result.active=false;
@@ -805,10 +949,10 @@ static void manager(void *unused)
         portENTER_CRITICAL(&mux);view.stack_free=uxTaskGetStackHighWaterMark(NULL);view.shutter_busy=shutter.pending||esp_timer_get_time()<shutter_cooldown;portEXIT_CRITICAL(&mux);
         portENTER_CRITICAL(&mux);view.action_busy=action_pending||yaw_anchor.pending||esp_timer_get_time()<action_cooldown;portEXIT_CRITICAL(&mux);
         if(sock>=0){
-            /* Wake for packets immediately; avoid a fixed 10ms accumulation
-               window in the default six-datagram lwIP inbox. */
+            /* Wake for packets immediately; also honor the next bounded ACK
+               retry without sleeping inside the single-writer send path. */
             int64_t wait_us=10000,now=esp_timer_get_time();
-            if(wire.have_status&&next_ack>now&&next_ack-now<wait_us)wait_us=next_ack-now;
+            if(wire.have_status&&ack_tx.next_due_us>now&&ack_tx.next_due_us-now<wait_us)wait_us=ack_tx.next_due_us-now;
             fd_set reads;FD_ZERO(&reads);FD_SET(sock,&reads);
             struct timeval timeout={.tv_sec=0,.tv_usec=(long)wait_us};
             if(select(sock+1,&reads,NULL,NULL,&timeout)<0&&errno!=EINTR)close_session(true,"UDP wait failed");

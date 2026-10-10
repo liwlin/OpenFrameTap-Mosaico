@@ -1,0 +1,9 @@
+CONFIG_OFT_MOSAICO_BOARD_V1_2=y
+# This V1.2 factory boot chain starts the PSRAM-XIP control image successfully.
+# Preserve this tested path until Flash-XIP startup is independently validated.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+# XIP already requires working PSRAM. Use IDF's PSRAM Wi-Fi path: referenced
+# pbufs,16 static internal TX buffers and32 bounded cache slots.
+CONFIG_SPIRAM_IGNORE_NOTFOUND=n
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=32

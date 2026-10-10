@@ -2,8 +2,10 @@
 
 ## 环境
 
-已验证环境是 Windows PowerShell、Git 和 ESP-IDF 6.1 / EIM，
-目标为 **esp32s31 preview**。现有包装脚本的默认安装路径是：
+本次 V1.2 开发预览版使用已验证的 Ubuntu2404 / WSL 构建，入口见
+[Ubuntu2404 构建说明](ubuntu2404.md)，板型和镜像见 [V1.2 说明](mosaico-v1.2.md)。
+目标为 **esp32s31 preview**。以下 Windows/EIM 包装脚本继承自 V1.0，
+本次未重新验证其构建环境；默认安装路径是：
 
 - SDK：`C:\esp\v6.1\esp-idf`
 - EIM：`C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1`
@@ -11,7 +13,7 @@
 
 脚本不升级 SDK，不修改其源码，并限制构建为最多两个并行任务。
 其他安装路径需调整包装脚本路径，或在正确的 IDF 环境中使用下列直接构建命令。
-本次拆分没有宣称 Linux / macOS 构建经过实测。
+Ubuntu2404 已验证；macOS 未验证。V1.2 不应直接使用原 Windows 包装脚本的 V1.0 默认产物路径。
 
 ```powershell
 git submodule update --init --recursive
@@ -32,7 +34,7 @@ idf.py --preview -C firmware/esp_mosaico -B artifacts/mosaico/build build
 
 ## 烧录边界：不是通用全量安装器
 
-当前分区表来自实测 Mosaico V1.0，表位于 **0x9000**，
+当前分区表来自上游 V1.0，并在本次 V1.2 设备上单独核对；表位于 **0x9000**，
 应用位于 **0x20000**，容量 **0x680000**。包装脚本只写应用：
 保留 bootloader、分区表、NVS、PHY、其他 NOR 分区及 SPI NAND。
 

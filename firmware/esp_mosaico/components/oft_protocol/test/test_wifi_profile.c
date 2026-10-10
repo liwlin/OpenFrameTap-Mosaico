@@ -1,6 +1,7 @@
 #include "unity.h"
 #include "oft_wifi_wire.h"
 #include "oft_pocket3.h"
+#include <errno.h>
 #include <string.h>
 
 /* Sanitized fixtures already committed in tests/test_{wifi_gimbal_control,
@@ -160,6 +161,34 @@ static void test_pending_heartbeat_loss_does_not_block_next(void)
     TEST_ASSERT_FALSE(oft_wifi_pending_take(&pending,1)); /* fixed four-slot bound */
     TEST_ASSERT_TRUE(oft_wifi_pending_take(&pending,5));
 }
+typedef struct {oft_wifi_ack_send_result_t result;unsigned calls;} ack_send_ctx_t;
+static oft_wifi_ack_send_result_t test_ack_send(const uint8_t *raw,size_t size,void *ctx)
+{
+    ack_send_ctx_t *c=(ack_send_ctx_t *)ctx;c->calls++;
+    TEST_ASSERT_EQUAL_UINT(34,size);TEST_ASSERT_EQUAL_HEX8(0x22,raw[0]);TEST_ASSERT_EQUAL_HEX8(4,raw[6]);
+    return c->result;
+}
+static void test_ack_retry_backoff_contract(void)
+{
+    TEST_ASSERT_EQUAL(OFT_WIFI_ACK_SEND_OK,oft_wifi_ack_classify_send(34,0));
+    TEST_ASSERT_EQUAL(OFT_WIFI_ACK_SEND_RETRY,oft_wifi_ack_classify_send(-1,ENOMEM));
+    TEST_ASSERT_EQUAL(OFT_WIFI_ACK_SEND_RETRY,oft_wifi_ack_classify_send(-1,EAGAIN));
+    TEST_ASSERT_EQUAL(OFT_WIFI_ACK_SEND_FATAL,oft_wifi_ack_classify_send(33,0));
+    TEST_ASSERT_EQUAL(OFT_WIFI_ACK_SEND_FATAL,oft_wifi_ack_classify_send(-1,EBADF));
+    oft_wifi_session_t s;oft_wifi_init(&s,0x7055,0x8300);s.peer=0x82d0;
+    TEST_ASSERT_TRUE(oft_wifi_observe(&s,status,sizeof(status)));
+    oft_wifi_session_t before=s;oft_wifi_ack_tx_t tx={0};ack_send_ctx_t send={.result=OFT_WIFI_ACK_SEND_RETRY};
+    TEST_ASSERT_EQUAL(OFT_WIFI_ACK_DEFERRED,oft_wifi_ack_tx_step(&tx,&s,1000,test_ack_send,&send));
+    TEST_ASSERT_TRUE(tx.retrying);TEST_ASSERT_TRUE(tx.first_failure_us==1000);TEST_ASSERT_TRUE(tx.next_due_us==6000);
+    for(unsigned i=0;i<16;i++)TEST_ASSERT_EQUAL(OFT_WIFI_ACK_IDLE,oft_wifi_ack_tx_step(&tx,&s,1001+i,test_ack_send,&send));
+    TEST_ASSERT_EQUAL_UINT(1,send.calls);
+    TEST_ASSERT_EQUAL(OFT_WIFI_ACK_DEFERRED,oft_wifi_ack_tx_step(&tx,&s,6000,test_ack_send,&send));
+    TEST_ASSERT_TRUE(tx.first_failure_us==1000);TEST_ASSERT_EQUAL_UINT(2,send.calls);
+    TEST_ASSERT_EQUAL(OFT_WIFI_ACK_FAILED,oft_wifi_ack_tx_step(&tx,&s,101000,test_ack_send,&send));
+    send.result=OFT_WIFI_ACK_SEND_OK;TEST_ASSERT_EQUAL(OFT_WIFI_ACK_SENT,oft_wifi_ack_tx_step(&tx,&s,102000,test_ack_send,&send));
+    TEST_ASSERT_FALSE(tx.retrying);TEST_ASSERT_TRUE(tx.next_due_us==127000);
+    TEST_ASSERT_EQUAL_MEMORY(&before,&s,sizeof(s));
+}
 static void test_direct_control_reply_before_media_classification(void)
 {
     /* Synthetic multiplexing regression matching the existing Python receive
@@ -188,9 +217,45 @@ static void test_cold_and_warm_advertisement(void)
     TEST_ASSERT_TRUE(oft_p3_advertisement(p,sizeof(p)));
     p[4]=0xc0;TEST_ASSERT_TRUE(oft_p3_advertisement(p,sizeof(p)));
     for(size_t n=0;n<11;n++)TEST_ASSERT_FALSE(oft_p3_advertisement(p,n));
-    p[4]=0x40;TEST_ASSERT_FALSE(oft_p3_advertisement(p,sizeof(p)));
+    p[4]=0x40;TEST_ASSERT_TRUE(oft_p3_advertisement(p,sizeof(p)));
+    p[4]=0x00;TEST_ASSERT_TRUE(oft_p3_advertisement(p,sizeof(p)));
+    p[4]=0x41;TEST_ASSERT_FALSE(oft_p3_advertisement(p,sizeof(p)));
     p[4]=0xc0;p[2]=0x21;TEST_ASSERT_FALSE(oft_p3_advertisement(p,sizeof(p)));
     TEST_ASSERT_FALSE(oft_p3_advertisement(NULL,11));
+}
+static void heartbeat_payload(uint8_t *p,uint8_t tilt,uint8_t speed)
+{
+    p[0]=0;p[1]=1;p[2]=4;p[3]=1;p[4]=tilt;p[5]=5;p[6]=1;p[7]=speed;
+}
+static void test_control_heartbeat_payload_contract(void)
+{
+    uint8_t p[16]={0};
+    for(uint8_t tilt=0;tilt<=1;tilt++)for(uint8_t speed=0;speed<=2;speed++){
+        heartbeat_payload(p,tilt,speed);
+        TEST_ASSERT_TRUE(oft_p3_control_heartbeat_payload_valid(p,8));
+    }
+    TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(NULL,8));
+    heartbeat_payload(p,0,1);
+    for(size_t n=0;n<8;n++)TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(p,n));
+    for(size_t n=9;n<=sizeof(p);n++)TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(p,n));
+    p[0]=0;p[1]=0;TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(p,2));
+    heartbeat_payload(p,0,1);
+    const size_t fixed[]={0,1,2,3,5,6};
+    for(size_t i=0;i<sizeof(fixed)/sizeof(fixed[0]);i++){
+        uint8_t saved=p[fixed[i]];p[fixed[i]]^=0xff;
+        TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(p,8));
+        p[fixed[i]]=saved;
+    }
+    heartbeat_payload(p,2,1);TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(p,8));
+    heartbeat_payload(p,0xff,1);TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(p,8));
+    heartbeat_payload(p,0,3);TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(p,8));
+    heartbeat_payload(p,0,0xff);TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(p,8));
+    const uint8_t reversed[]={0,1,5,1,1,4,1,0};
+    TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(reversed,sizeof(reversed)));
+    const uint8_t repeated_tilt[]={0,1,4,1,0,4,1,1};
+    TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(repeated_tilt,sizeof(repeated_tilt)));
+    const uint8_t repeated_speed[]={0,1,5,1,0,5,1,1};
+    TEST_ASSERT_FALSE(oft_p3_control_heartbeat_payload_valid(repeated_speed,sizeof(repeated_speed)));
 }
 void oft_wifi_profile_selftests(void)
 {
@@ -203,7 +268,9 @@ void oft_wifi_profile_selftests(void)
     RUN_TEST(test_handshake_and_registration_boundaries);
     RUN_TEST(test_media_receipt_does_not_advance_operator);
     RUN_TEST(test_pending_heartbeat_loss_does_not_block_next);
+    RUN_TEST(test_ack_retry_backoff_contract);
     RUN_TEST(test_direct_control_reply_before_media_classification);
     RUN_TEST(test_gimbal_candidate_layout_provenance);
     RUN_TEST(test_cold_and_warm_advertisement);
+    RUN_TEST(test_control_heartbeat_payload_contract);
 }

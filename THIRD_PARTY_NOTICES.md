@@ -30,6 +30,10 @@ ESP-IDF component manager, not copied into this repository.
 When distributing firmware binaries, collect the applicable LICENSE / NOTICE
 files from the exact SDK and managed component versions used for that build.
 This source repository does not include a binary-release license bundle.
+Published firmware ZIPs carry the collected notices in `licenses/`, together
+with an index of the exact files and hashes. The collection can include notices
+for optional source shipped with a component; it does not assert that every
+such optional feature is linked into the application.
 
 ## Protocol and board references
 
@@ -44,6 +48,6 @@ reference revision `9c4e7334`),
 These repositories are references, not bundled dependencies or blanket grants
 to redistribute their implementations.
 
-Board wiring follows Espressif's Mosaico V1.0 configuration; actual display
+Board wiring follows Espressif's Mosaico V1.0 / V1.2 configurations; actual display
 initialization is provided by the pinned public driver. Keep existing provenance
 comments and sanitized test-fixture metadata when modifying the code.

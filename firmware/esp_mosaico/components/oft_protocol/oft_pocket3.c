@@ -86,10 +86,20 @@ bool oft_p3_battery(const oft_duml_frame_t *f,uint8_t *percent)
 }
 bool oft_p3_advertisement(const uint8_t *p,size_t n)
 {
-    /* Same owner's Pocket3: warm 20 00 80 and cold 20 00 C0. The fifth
-       manufacturer byte is not an immutable model ID. Do not admit unseen
-       model prefixes or arbitrary flag values based on DJI company ID alone. */
-    return p&&n>=11&&p[0]==0xaa&&p[1]==8&&p[2]==0x20&&p[3]==0&&(p[4]==0x80||p[4]==0xc0);
+    /* Pocket 3 model prefix: 20 00. Observed state bytes are 00/40/80/C0
+       (00 captured from the remembered camera on2026-10-09); not the model ID. Its precise
+       meaning remains unknown. Keep other models and unseen states excluded. */
+    return p&&n>=11&&p[0]==0xaa&&p[1]==8&&p[2]==0x20&&p[3]==0&&
+        (p[4]==0x00||p[4]==0x40||p[4]==0x80||p[4]==0xc0);
+}
+bool oft_p3_control_heartbeat_payload_valid(const uint8_t *p,size_t n)
+{
+    /* 04/50 GET 01 04 05 returns current tilt and follow-speed parameters,
+       not a fixed ACK: 00 01 04 01 <tilt> 05 01 <speed>.
+       Pocket 3: tilt=Follow/Locked (0/1), speed=Fast/Default/Slow (0/1/2).
+       Keep status, shape, order and known value domains strict. */
+    return p&&n==8&&p[0]==0&&p[1]==1&&p[2]==4&&p[3]==1&&
+        p[4]<=1&&p[5]==5&&p[6]==1&&p[7]<=2;
 }
 size_t oft_p3_registration_reply(const oft_duml_frame_t *r,uint8_t *out,size_t cap)
 {

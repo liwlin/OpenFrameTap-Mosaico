@@ -1,6 +1,7 @@
 /* GPIO/driver references: espressif/esp_boards 0.6.1 esp_mosaico V1.0.
  * No private panel init sequence: use the CO5300 driver's stock QSPI sequence. */
 #include "oft_board.h"
+#include "oft_board_pins.h"
 #include "oft_ui.h"
 #include "oft_touch.h"
 #include "driver/gpio.h"
@@ -90,6 +91,8 @@ esp_err_t oft_board_display_start(void)
 {
     alignment_selftest_passed=alignment_selftest();
     ESP_RETURN_ON_FALSE(alignment_selftest_passed,ESP_FAIL,TAG,"alignment self-test");
+    ESP_LOGI(TAG,"board=%s i2c_sda=%d i2c_scl=%d lcd_sclk=%d lcd_rst=%d",
+             OFT_BOARD_NAME,OFT_BOARD_I2C_SDA,OFT_BOARD_I2C_SCL,OFT_BOARD_LCD_SCLK,OFT_BOARD_LCD_RST);
     /* Mosaico peripheral rail: active low. Audio remains off; do not drive
        GPIO57 (whole-device power-off), boot strap or NAND/expansion pins. */
     gpio_config_t power={.pin_bit_mask=1ULL<<60,.mode=GPIO_MODE_OUTPUT};
@@ -98,18 +101,18 @@ esp_err_t oft_board_display_start(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     i2c_master_bus_handle_t bus=NULL;
-    i2c_master_bus_config_t i2c={.i2c_port=0,.sda_io_num=0,.scl_io_num=1,
+    i2c_master_bus_config_t i2c={.i2c_port=0,.sda_io_num=OFT_BOARD_I2C_SDA,.scl_io_num=OFT_BOARD_I2C_SCL,
         .clk_source=I2C_CLK_SRC_DEFAULT,.glitch_ignore_cnt=7,.flags.enable_internal_pullup=true};
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c,&bus),TAG,"I2C bus");
     shared_i2c=bus;
-    spi_bus_config_t spi=CO5300_PANEL_BUS_QSPI_CONFIG(44,36,51,35,9,480*40*2);
+    spi_bus_config_t spi=CO5300_PANEL_BUS_QSPI_CONFIG(OFT_BOARD_LCD_SCLK,36,51,35,9,480*40*2);
     ESP_RETURN_ON_ERROR(spi_bus_initialize(SPI2_HOST,&spi,SPI_DMA_CH_AUTO),TAG,"QSPI bus");
     esp_lcd_panel_io_handle_t io=NULL;
     esp_lcd_panel_io_spi_config_t io_cfg=CO5300_PANEL_IO_QSPI_CONFIG(50,NULL,NULL);
     io_cfg.flags.psram_dma_direct=true;
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,&io_cfg,&io),TAG,"panel IO");
     co5300_vendor_config_t vendor={.flags.use_qspi_interface=1};
-    const esp_lcd_panel_dev_config_t panel_cfg={.reset_gpio_num=42,
+    const esp_lcd_panel_dev_config_t panel_cfg={.reset_gpio_num=OFT_BOARD_LCD_RST,
         .rgb_ele_order=LCD_RGB_ELEMENT_ORDER_RGB,.bits_per_pixel=16,.vendor_config=&vendor};
     esp_lcd_panel_handle_t panel=NULL;
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_co5300(io,&panel_cfg,&panel),TAG,"CO5300");

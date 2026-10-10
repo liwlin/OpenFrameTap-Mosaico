@@ -36,6 +36,8 @@ static oft_settings_snapshot_t setting_view;
 static lv_obj_t *limit_banner,*limit_text;
 static lv_obj_t *preview_image,*preview_note;static lv_image_dsc_t preview_descriptor;
 static bool preview_assigned,preview_presented;
+static atomic_bool preview_enabled=true;
+void oft_ui_preview_enabled(bool enabled){atomic_store(&preview_enabled,enabled);}
 static uint16_t *preview_pixels;static uint32_t preview_generation;
 static float yaw,pitch;
 static bool active;
@@ -272,7 +274,7 @@ static void button_event(lv_event_t *e)
     else if(strcmp(name,"180 deg")==0)oft_udp_action(true);
 }
 static void select_event(lv_event_t *e){if(shadow_event(e))return;oft_ble_select((unsigned)(uintptr_t)lv_event_get_user_data(e));}
-static void mode_event(lv_event_t *e){if(shadow_event(e))return;if(atomic_load(&shadow_running))shadow_aborted=true;stop_inputs();oft_udp_head_mode((uintptr_t)lv_event_get_user_data(e)==1);if((uintptr_t)lv_event_get_user_data(e)==1)menu_set(OFT_MENU_NONE);}
+static void mode_event(lv_event_t *e){if(shadow_event(e))return;if(atomic_load(&shadow_running))shadow_aborted=true;stop_inputs();oft_ui_preview_enabled(true);oft_udp_head_mode((uintptr_t)lv_event_get_user_data(e)==1);if((uintptr_t)lv_event_get_user_data(e)==1)menu_set(OFT_MENU_NONE);}
 static void head_event(lv_event_t *e)
 {
     lv_event_code_t code=lv_event_get_code(e);
@@ -305,12 +307,13 @@ static void refresh(lv_timer_t *timer)
     }
     oft_udp_snapshot_t udp;oft_udp_snapshot(&udp);
     settings_ui_update(udp);
-    oft_video_visible(udp.head_mode);
+    bool show_preview=atomic_load(&preview_enabled)&&v.state!=OFT_BLE_SCANNING;
+    oft_video_visible(show_preview);
     oft_video_snapshot_t picture;oft_video_snapshot(&picture);
-    if(picture.ready&&udp.head_mode&&!preview_pixels)
+    if(picture.ready&&show_preview&&!preview_pixels)
         preview_pixels=heap_caps_malloc(352*198*2,MALLOC_CAP_SPIRAM);
     int64_t picture_source_us=0;
-    uint32_t frame=udp.head_mode?oft_video_copy_timed(preview_pixels,352*198*2,preview_generation,&picture_source_us):0;
+    uint32_t frame=show_preview?oft_video_copy_timed(preview_pixels,352*198*2,preview_generation,&picture_source_us):0;
     if(frame){
         preview_descriptor.header.magic=LV_IMAGE_HEADER_MAGIC;preview_descriptor.header.cf=LV_COLOR_FORMAT_RGB565;
         preview_descriptor.header.w=picture.display_width;preview_descriptor.header.h=picture.display_height;
@@ -321,7 +324,7 @@ static void refresh(lv_timer_t *timer)
         lv_obj_invalidate(preview_image);preview_assigned=true;preview_generation=frame;oft_video_presented();
         printf("OFT_VIDEO_PRESENT generation=%lu source_us=%lld ui_us=%lld\n",(unsigned long)frame,(long long)picture_source_us,(long long)esp_timer_get_time());
     }
-    if(udp.head_mode&&preview_assigned){
+    if(show_preview&&preview_assigned){
         lv_obj_remove_flag(preview_image,LV_OBJ_FLAG_HIDDEN);lv_obj_add_flag(preview_note,LV_OBJ_FLAG_HIDDEN);
         if(esp_timer_get_time()-picture.last_frame_us>5000000){
             lv_label_set_text(preview_note,picture.refresh_failures?"IMAGE STALE - VIDEO FAULT":
@@ -334,13 +337,13 @@ static void refresh(lv_timer_t *timer)
         if(!preview_presented){printf("OFT_PREVIEW_PRESENTED width=%u height=%u frozen=0\n",picture.display_width,picture.display_height);preview_presented=true;}
     }else{
         lv_obj_add_flag(preview_image,LV_OBJ_FLAG_HIDDEN);
-        if(udp.head_mode){lv_label_set_text(preview_note,picture.detail);lv_obj_remove_flag(preview_note,LV_OBJ_FLAG_HIDDEN);}
+        if(show_preview){lv_label_set_text(preview_note,picture.detail);lv_obj_remove_flag(preview_note,LV_OBJ_FLAG_HIDDEN);}
         else lv_obj_add_flag(preview_note,LV_OBJ_FLAG_HIDDEN);
     }
     live_control=udp.live_enabled;
     if(udp.action_busy||udp.settings_busy||!udp.head_sensor_ready)lv_obj_add_state(head_button,LV_STATE_DISABLED);else lv_obj_remove_state(head_button,LV_STATE_DISABLED);
     for(unsigned i=0;i<2;i++)lv_obj_set_style_bg_color(mode_buttons[i],lv_color_hex(udp.head_mode==(i==1)?0x287e9d:0x203347),0);
-    const char *mode=udp.state==OFT_UDP_FAULT?"FAULT":live_control?(udp.control_state==OFT_CONTROL_ACTIVE?"LIVE ACTIVE":"LIVE READY"):"CONNECTING";
+    const char *mode=udp.state==OFT_UDP_FAULT?"FAULT":udp.control_state==OFT_CONTROL_FAULT?"CONTROL PAUSED":live_control?(udp.control_state==OFT_CONTROL_ACTIVE?"LIVE ACTIVE":"LIVE READY"):"CONNECTING";
     lv_label_set_text_fmt(values,"%s  Y %+d%%  P %+d%%",mode,(int)(yaw*100),(int)(pitch*100));
     if(udp.head_mode){
         lv_label_set_text_fmt(values,"HEAD Y %s%d.%d P %s%d.%d",
@@ -354,8 +357,8 @@ static void refresh(lv_timer_t *timer)
     }else lv_obj_add_flag(limit_banner,LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_text_color(values,lv_color_hex(udp.state==OFT_UDP_FAULT?0xff6a60:live_control?0x35e0b1:0xa9b7c8),0);
     lv_label_set_text(action_labels[0],live_control?"Center":"Scan");
-    if(live_control&&!udp.action_busy)lv_obj_remove_state(action_buttons[1],LV_STATE_DISABLED);else lv_obj_add_state(action_buttons[1],LV_STATE_DISABLED);
-    if(live_control&&udp.action_busy)lv_obj_add_state(action_buttons[0],LV_STATE_DISABLED);else lv_obj_remove_state(action_buttons[0],LV_STATE_DISABLED);
+    if(live_control&&!udp.action_busy&&udp.control_state!=OFT_CONTROL_FAULT)lv_obj_remove_state(action_buttons[1],LV_STATE_DISABLED);else lv_obj_add_state(action_buttons[1],LV_STATE_DISABLED);
+    if(live_control&&(udp.action_busy||udp.control_state==OFT_CONTROL_FAULT))lv_obj_add_state(action_buttons[0],LV_STATE_DISABLED);else lv_obj_remove_state(action_buttons[0],LV_STATE_DISABLED);
     if(udp.state!=OFT_UDP_OFF)lv_label_set_text(connection_label,udp.detail);
     if(udp.head_mode&&udp.state==OFT_UDP_READY)lv_label_set_text(connection_label,
         !udp.head_sensor_ready?(udp.head_sensor_calibrated?"IMU recovering: release, then hold again":"Place Mosaico still for 2s to initialize IMU"):

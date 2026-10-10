@@ -22,3 +22,7 @@ void oft_control_tick(oft_control_t *control,const oft_input_t *input,bool gate,
     oft_control_send_t send,void *context);
 void oft_control_stop(oft_control_t *control,bool fault,int64_t now_us,oft_control_send_t send,void *context);
 void oft_control_reset(oft_control_t *control);
+bool oft_control_is_guard_fault(const oft_control_t *control);
+/* Owner must include fresh link and latest neutral transport receipt in gate.
+   This resets no gesture history and never emits a command. */
+bool oft_control_rearm_on_release(oft_control_t *control,const oft_input_t *input,bool gate,int64_t now_us);

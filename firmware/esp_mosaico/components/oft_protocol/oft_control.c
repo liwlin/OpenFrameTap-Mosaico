@@ -39,10 +39,19 @@ void oft_control_stop(oft_control_t *c,bool fault,int64_t now,oft_control_send_t
 }
 void oft_control_reset(oft_control_t *c)
 {
-    /* Only an explicit session reset may clear the fault; retain old gesture
-       block and do not erase uncertainty about an undelivered zero. */
+    /* Explicit reset, also used after an owner-confirmed guard release. Retain
+       the gesture block and uncertainty about an undelivered zero. */
     if(c->stop_required)return;
     c->state=OFT_CONTROL_DISABLED;
+}
+bool oft_control_is_guard_fault(const oft_control_t *c)
+{
+    return c&&c->state==OFT_CONTROL_FAULT&&!c->stop_required&&!c->failures;
+}
+bool oft_control_rearm_on_release(oft_control_t *c,const oft_input_t *in,bool gate,int64_t now)
+{
+    if(!oft_control_is_guard_fault(c)||!gate||!in||in->active||in->timestamp_us>now||now-in->timestamp_us>=250000)return false;
+    oft_control_reset(c);return c->state!=OFT_CONTROL_FAULT;
 }
 void oft_control_tick(oft_control_t *c,const oft_input_t *in,bool gate,int64_t now,
     oft_control_send_t send,void *ctx)
